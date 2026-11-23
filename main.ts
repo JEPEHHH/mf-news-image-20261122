@@ -4,11 +4,20 @@
  * Standalone: `node main.ts` writes /output/entry.png.
  * No dependencies, no network, no Date/Math.random: every run is byte-identical.
  *
- *   raster:   flat RGBA byte buffer, opaque, alpha-composited by hand
- *   type:     hand-drawn 5x7 bitmap font, proportional advance, drawn as pixel squares
- *   png:      IHDR + IDAT (zlib.deflateSync) + IEND with a table-driven CRC32
+ *   type      single-stroke letterforms in the Hershey simplex lineage: A-Z, a-z, 0-9
+ *             and the punctuation press English actually needs, defined as polylines
+ *             on a fixed 100-unit cap grid and stroked with round caps and joins.
+ *             Display type is heavy, body copy is light and condensed; every line is
+ *             measured before it is set and long lines are justified.
+ *   raster    one flat RGBA buffer on a 3x supersampled device grid (4560 x 7560),
+ *             box-filtered down to 1520 x 2520, so strokes and pictures carry real
+ *             anti-aliasing instead of pixel steps.
+ *   pictures  photographs: two raw RGB plates, resampled to device resolution with a
+ *             Catmull-Rom separable filter, graded, and darkened under a gradient
+ *             wherever type sits on top of them.
+ *   png       IHDR + IDAT (zlib.deflateSync) + IEND with a table-driven CRC32.
  *
- * Page grid: 1520 x 2165. Lead package occupies exactly 60% of the page height.
+ * Page grid: 1520 x 2520. The lead package occupies exactly 60% of the page height.
  */
 
 import * as fs from "node:fs";
@@ -16,286 +25,443 @@ import * as zlib from "node:zlib";
 
 /* ============================================================ 1. geometry == */
 
+const SS = 3;                                 // supersampling factor
 const W = 1520;
+const H = 2520;
+const DW = W * SS;
+const DH = H * SS;
+
 const M = 56;                                 // page margin
 const CONTENT = W - 2 * M;                    // 1408
 
-const GUT = 40;                               // column gutter
-const SIDE_W = 448;                           // right hand column
-const LEAD_W = CONTENT - GUT - SIDE_W;        // 920
-const SIDE_X = M + LEAD_W + GUT;              // 1016
+const GUT = 38;                               // column gutter
+const SIDE_W = 442;                           // right hand column
+const LEAD_W = CONTENT - GUT - SIDE_W;        // 928
+const SIDE_X = M + LEAD_W + GUT;              // 1022
 
-const LEAD_TOP = 330;                         // first baseline row under the masthead rule
-const TICK_H = 600;
-// the lead package is fixed at 60% of the page height: H = 0.4H + lead top + gap + ticker + margin
-const H = Math.round((LEAD_TOP + 22 + TICK_H + M) / 0.4);
-const LEAD_H = Math.round(H * 0.6);
-const LEAD_BOT = LEAD_TOP + LEAD_H;
-const TICK_TOP = LEAD_BOT + 22;
+const LEAD_TOP = 352;                         // first row of the lead package
+const LEAD_H = Math.round(H * 0.6);           // the lead is 60% of the page height
+const LEAD_BOT = LEAD_TOP + LEAD_H;           // 1864
+const TICK_TOP = LEAD_BOT + 24;               // 1888
 
 /* =============================================================== 2. colour == */
 
 type RGB = [number, number, number];
 
 const INK: RGB = [18, 24, 31];                // #12181f
-const PAPER: RGB = [242, 236, 225];           // #f2ece1
-const PAPER_HI: RGB = [248, 244, 236];
-const PAPER_LO: RGB = [231, 223, 208];
-const BRICK: RGB = [179, 64, 47];             // #b3402f
-const BRICK_DK: RGB = [143, 45, 31];          // #8f2d1f, for small type on paper
+const INK_2: RGB = [44, 52, 62];
+const PAPER: RGB = [245, 239, 228];           // #f5efe4
+const PAPER_HI: RGB = [250, 246, 238];
+const PAPER_LO: RGB = [233, 225, 210];
+const BRICK: RGB = [166, 58, 42];             // #a63a2a
+const BRICK_DK: RGB = [132, 44, 32];
 const TEAL: RGB = [47, 111, 106];             // #2f6f6a
 const WHITE: RGB = [250, 247, 241];
 
 function mix(a: RGB, b: RGB, t: number): RGB {
+  const u = t < 0 ? 0 : t > 1 ? 1 : t;
   return [
-    Math.round(a[0] + (b[0] - a[0]) * t),
-    Math.round(a[1] + (b[1] - a[1]) * t),
-    Math.round(a[2] + (b[2] - a[2]) * t),
+    a[0] + (b[0] - a[0]) * u,
+    a[1] + (b[1] - a[1]) * u,
+    a[2] + (b[2] - a[2]) * u,
   ];
 }
-const INK_SOFT = mix(INK, PAPER, 0.36);
-const HAIR = mix(INK, PAPER, 0.62);
+const INK_SOFT = mix(INK, PAPER, 0.38);
+const HAIR = mix(INK, PAPER, 0.64);
+const RULE = mix(INK, PAPER, 0.46);
+
+const clamp01 = (v: number) => (v < 0 ? 0 : v > 1 ? 1 : v);
+const clamp = (v: number, lo: number, hi: number) => (v < lo ? lo : v > hi ? hi : v);
+const smooth = (t: number) => { const u = clamp01(t); return u * u * (3 - 2 * u); };
+const ss01 = (a: number, b: number, x: number) => smooth((x - a) / (b - a || 1e-9));
+
+function ramp(stops: [number, RGB][], t: number): RGB {
+  if (t <= stops[0][0]) return stops[0][1];
+  for (let i = 0; i + 1 < stops.length; i++) {
+    const [p0, c0] = stops[i], [p1, c1] = stops[i + 1];
+    if (t <= p1) return mix(c0, c1, (t - p0) / (p1 - p0 || 1e-9));
+  }
+  return stops[stops.length - 1][1];
+}
 
 /* ================================================================ 3. raster = */
 
-const buf = new Uint8Array(W * H * 4);
+const dev = new Uint8Array(DW * DH * 4);
 
-function px(x: number, y: number, c: RGB, a = 1) {
+/** artwork is clipped to its own frame, so nothing bleeds onto the paper */
+let CLIP: [number, number, number, number] | null = null;
+function clipTo(x: number, y: number, w: number, h: number) {
+  const prev = CLIP;
+  CLIP = [
+    Math.max(0, Math.round(x * SS)), Math.max(0, Math.round(y * SS)),
+    Math.min(DW, Math.round((x + w) * SS)), Math.min(DH, Math.round((y + h) * SS)),
+  ];
+  return prev;
+}
+
+function putD(x: number, y: number, c: RGB, a: number) {
   if (a <= 0) return;
-  const xi = x | 0, yi = y | 0;
-  if (xi < 0 || yi < 0 || xi >= W || yi >= H) return;
-  const i = (yi * W + xi) * 4;
-  buf[i + 3] = 255;                           // canvas is opaque everywhere
+  if (CLIP && (x < CLIP[0] || y < CLIP[1] || x >= CLIP[2] || y >= CLIP[3])) return;
+  if (x < 0 || y < 0 || x >= DW || y >= DH) return;
+  const i = (y * DW + x) * 4;
   if (a >= 1) {
-    buf[i] = c[0]; buf[i + 1] = c[1]; buf[i + 2] = c[2];
+    dev[i] = c[0]; dev[i + 1] = c[1]; dev[i + 2] = c[2];
     return;
   }
-  buf[i] += (c[0] - buf[i]) * a;
-  buf[i + 1] += (c[1] - buf[i + 1]) * a;
-  buf[i + 2] += (c[2] - buf[i + 2]) * a;
+  dev[i] = Math.round(dev[i] + (c[0] - dev[i]) * a);
+  dev[i + 1] = Math.round(dev[i + 1] + (c[1] - dev[i + 1]) * a);
+  dev[i + 2] = Math.round(dev[i + 2] + (c[2] - dev[i + 2]) * a);
 }
 
+/** device-space rectangle with exact area coverage — soft edges, no staircase */
+function fillD(x0: number, y0: number, x1: number, y1: number, c: RGB, a = 1) {
+  if (x1 <= x0 || y1 <= y0) return;
+  const fx0 = x0 > 0 ? x0 : 0, fx1 = x1 < DW ? x1 : DW;
+  const fy0 = y0 > 0 ? y0 : 0, fy1 = y1 < DH ? y1 : DH;
+  if (fx1 <= fx0 || fy1 <= fy0) return;
+  const ix0 = Math.floor(fx0), ix1 = Math.ceil(fx1) - 1;
+  const iy0 = Math.floor(fy0), iy1 = Math.ceil(fy1) - 1;
+  for (let yd = iy0; yd <= iy1; yd++) {
+    const oy = Math.min(fy1, yd + 1) - Math.max(fy0, yd);
+    if (oy <= 0) continue;
+    for (let xd = ix0; xd <= ix1; xd++) {
+      const ox = Math.min(fx1, xd + 1) - Math.max(fx0, xd);
+      if (ox <= 0) continue;
+      putD(xd, yd, c, a * (ox >= 1 && oy >= 1 ? 1 : ox * oy));
+    }
+  }
+}
+
+/** page-space rectangle (sub-pixel coordinates welcome) */
 function rect(x: number, y: number, w: number, h: number, c: RGB, a = 1) {
-  for (let j = y; j < y + h; j++) for (let i = x; i < x + w; i++) px(i, j, c, a);
+  fillD(x * SS, y * SS, (x + w) * SS, (y + h) * SS, c, a);
 }
 
-function gradRect(x: number, y: number, w: number, h: number, c0: RGB, c1: RGB) {
-  for (let j = 0; j < h; j++) {
-    const c = mix(c0, c1, h <= 1 ? 0 : j / (h - 1));
-    for (let i = x; i < x + w; i++) px(i, y + j, c);
+/** vertical gradient across a page-space band */
+function gradV(x: number, y: number, w: number, h: number, stops: [number, RGB][]) {
+  const n = Math.max(1, Math.round(h));
+  for (let j = 0; j < n; j++) rect(x, y + j, w, 1, ramp(stops, n <= 1 ? 0 : j / (n - 1)));
+}
+
+/** per-device-pixel shader over a page-space box; fn writes into SHADE, true to paint */
+const SHADE = new Float64Array(4);
+function shadeRect(x: number, y: number, w: number, h: number,
+                   fn: (u: number, v: number, xl: number, yl: number) => boolean) {
+  const X0 = Math.max(0, Math.floor(x * SS)), X1 = Math.min(DW - 1, Math.ceil((x + w) * SS));
+  const Y0 = Math.max(0, Math.floor(y * SS)), Y1 = Math.min(DH - 1, Math.ceil((y + h) * SS));
+  const col: RGB = [0, 0, 0];
+  for (let yd = Y0; yd <= Y1; yd++) {
+    const yl = (yd + 0.5) / SS, v = (yl - y) / h;
+    for (let xd = X0; xd <= X1; xd++) {
+      const xl = (xd + 0.5) / SS, u = (xl - x) / w;
+      if (!fn(u, v, xl, yl)) continue;
+      col[0] = SHADE[0]; col[1] = SHADE[1]; col[2] = SHADE[2];
+      putD(xd, yd, col, SHADE[3]);
+    }
   }
 }
 
-function disc(cx: number, cy: number, r: number, c: RGB, a = 1) {
-  const r2 = r * r;
-  for (let j = Math.floor(cy - r); j <= Math.ceil(cy + r); j++)
-    for (let i = Math.floor(cx - r); i <= Math.ceil(cx + r); i++) {
-      const dx = i - cx, dy = j - cy;
-      if (dx * dx + dy * dy <= r2) px(i, j, c, a);
+function discAA(cx: number, cy: number, r: number, c: RGB, a = 1) {
+  if (r <= 0) return;
+  const X0 = Math.max(0, Math.floor((cx - r - 1) * SS)), X1 = Math.min(DW - 1, Math.ceil((cx + r + 1) * SS));
+  const Y0 = Math.max(0, Math.floor((cy - r - 1) * SS)), Y1 = Math.min(DH - 1, Math.ceil((cy + r + 1) * SS));
+  for (let yd = Y0; yd <= Y1; yd++) {
+    const yl = (yd + 0.5) / SS, dy = yl - cy;
+    for (let xd = X0; xd <= X1; xd++) {
+      const xl = (xd + 0.5) / SS, dx = xl - cx;
+      const cov = (r - Math.sqrt(dx * dx + dy * dy)) * SS + 0.5;
+      if (cov > 0) putD(xd, yd, c, a * (cov < 1 ? cov : 1));
     }
-}
-
-function ring(cx: number, cy: number, r: number, c: RGB, thick: number, a = 1) {
-  const ro = r + thick + 1;
-  for (let j = Math.floor(cy - ro); j <= Math.ceil(cy + ro); j++)
-    for (let i = Math.floor(cx - ro); i <= Math.ceil(cx + ro); i++) {
-      const d = Math.hypot(i - cx, j - cy);
-      if (Math.abs(d - r) <= thick) px(i, j, c, a);
-    }
-}
-
-function line(x0: number, y0: number, x1: number, y1: number, c: RGB, thick = 1, a = 1) {
-  const dx = x1 - x0, dy = y1 - y0;
-  const n = Math.max(Math.abs(dx), Math.abs(dy), 1);
-  const h = (thick - 1) / 2;
-  for (let s = 0; s <= n; s++) {
-    const x = Math.round(x0 + (dx * s) / n);
-    const y = Math.round(y0 + (dy * s) / n);
-    for (let oy = -h; oy <= h; oy++) for (let ox = -h; ox <= h; ox++) px(x + ox, y + oy, c, a);
   }
 }
 
-function poly(pts: [number, number][], c: RGB, a = 1) {
+/** a straight line with round caps: the workhorse of the type */
+function lineAA(x0: number, y0: number, x1: number, y1: number, c: RGB, thick = 1, a = 1) {
+  const h = Math.max(thick, 0.05) / 2;
+  const X0 = Math.max(0, Math.floor((Math.min(x0, x1) - h - 1) * SS));
+  const X1 = Math.min(DW - 1, Math.ceil((Math.max(x0, x1) + h + 1) * SS));
+  const Y0 = Math.max(0, Math.floor((Math.min(y0, y1) - h - 1) * SS));
+  const Y1 = Math.min(DH - 1, Math.ceil((Math.max(y0, y1) + h + 1) * SS));
+  const dx = x1 - x0, dy = y1 - y0, l2 = dx * dx + dy * dy || 1e-9;
+  for (let yd = Y0; yd <= Y1; yd++) {
+    const yl = (yd + 0.5) / SS;
+    for (let xd = X0; xd <= X1; xd++) {
+      const xl = (xd + 0.5) / SS;
+      let t = ((xl - x0) * dx + (yl - y0) * dy) / l2;
+      t = t < 0 ? 0 : t > 1 ? 1 : t;
+      const qx = x0 + dx * t, qy = y0 + dy * t;
+      const d = Math.sqrt((xl - qx) * (xl - qx) + (yl - qy) * (yl - qy));
+      const cov = (h - d) * SS + 0.5;
+      if (cov > 0) putD(xd, yd, c, a * (cov < 1 ? cov : 1));
+    }
+  }
+}
+
+type Pt = [number, number];
+
+/** a stroked polyline: round caps, round joins, constant weight */
+function strokePoly(pts: Pt[], c: RGB, thick: number, a = 1) {
+  if (!pts.length) return;
+  if (pts.length === 1) { discAA(pts[0][0], pts[0][1], thick / 2, c, a); return; }
+  for (let i = 0; i + 1 < pts.length; i++)
+    lineAA(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1], c, thick, a);
+}
+
+function poly(pts: Pt[], c: RGB, a = 1) {
   let lo = Infinity, hi = -Infinity;
   for (const p of pts) { lo = Math.min(lo, p[1]); hi = Math.max(hi, p[1]); }
-  for (let y = Math.floor(lo); y <= Math.ceil(hi); y++) {
-    const xs: number[] = [];
+  const X0 = Math.max(0, Math.floor((Math.min(...pts.map((p) => p[0])) - 1) * SS));
+  const X1 = Math.min(DW - 1, Math.ceil((Math.max(...pts.map((p) => p[0])) + 1) * SS));
+  const Y0 = Math.max(0, Math.floor(lo * SS)), Y1 = Math.min(DH - 1, Math.ceil(hi * SS));
+  const xs: number[] = [];
+  for (let yd = Y0; yd <= Y1; yd++) {
+    const yl = (yd + 0.5) / SS;
+    xs.length = 0;
     for (let i = 0; i < pts.length; i++) {
-      const [x1, y1] = pts[i], [x2, y2] = pts[(i + 1) % pts.length];
-      if ((y1 <= y && y2 > y) || (y2 <= y && y1 > y)) xs.push(x1 + ((y - y1) / (y2 - y1)) * (x2 - x1));
+      const [ax, ay] = pts[i], [bx, by] = pts[(i + 1) % pts.length];
+      if ((ay <= yl && by > yl) || (by <= yl && ay > yl)) xs.push(ax + ((yl - ay) / (by - ay)) * (bx - ax));
     }
+    if (xs.length < 2) continue;
     xs.sort((p, q) => p - q);
-    for (let k = 0; k + 1 < xs.length; k += 2)
-      for (let x = Math.ceil(xs[k]); x <= Math.floor(xs[k + 1]); x++) px(x, y, c, a);
+    for (let k = 0; k + 1 < xs.length; k += 2) {
+      const xa = Math.max(X0, Math.floor(xs[k] * SS)), xb = Math.min(X1, Math.ceil(xs[k + 1] * SS));
+      for (let xd = xa; xd <= xb; xd++) {
+        const xl = (xd + 0.5) / SS;
+        if (xl >= xs[k] && xl < xs[k + 1]) putD(xd, yd, c, a);
+      }
+    }
   }
 }
 
-/* =========================================================== 4. bitmap font = */
-/* Cell is 5 wide, 7 tall (rows 0..6). '#' marks ink. Lower case sits on a five
-   row x-height (rows 2..6) and may use rows 7..8 for descenders.              */
+/* ============================================================== 4. the type = */
+/* A single-stroke face drawn the way Hershey drew his: every letterform is a set
+   of polylines on one fixed grid — cap height at 0, x-height at 30, baseline at
+   100, descender at 140 — stroked with round caps and joins. Curves are polygonal,
+   as they were on the original plotters, and read as curves at 3x supersampling.   */
 
-const GLYPHS: Record<string, string[]> = {
-  A: [".###.", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"],
-  B: ["####.", "#...#", "#...#", "####.", "#...#", "#...#", "####."],
-  C: [".###.", "#...#", "#....", "#....", "#....", "#...#", ".###."],
-  D: ["####.", "#...#", "#...#", "#...#", "#...#", "#...#", "####."],
-  E: ["#####", "#....", "#....", "####.", "#....", "#....", "#####"],
-  F: ["#####", "#....", "#....", "####.", "#....", "#....", "#...."],
-  G: [".###.", "#...#", "#....", "#.###", "#...#", "#...#", ".###."],
-  H: ["#...#", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"],
-  I: ["#####", "..#..", "..#..", "..#..", "..#..", "..#..", "#####"],
-  J: ["..###", "...#.", "...#.", "...#.", "...#.", "#..#.", ".##.."],
-  K: ["#...#", "#..#.", "#.#..", "##...", "#.#..", "#..#.", "#...#"],
-  L: ["#....", "#....", "#....", "#....", "#....", "#....", "#####"],
-  M: ["#...#", "##.##", "#.#.#", "#...#", "#...#", "#...#", "#...#"],
-  N: ["#...#", "##..#", "#.#.#", "#..##", "#...#", "#...#", "#...#"],
-  O: [".###.", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."],
-  P: ["####.", "#...#", "#...#", "####.", "#....", "#....", "#...."],
-  Q: [".###.", "#...#", "#...#", "#...#", "#.#.#", "#..#.", ".##.#"],
-  R: ["####.", "#...#", "#...#", "####.", "#.#..", "#..#.", "#...#"],
-  S: [".####", "#....", "#....", ".###.", "....#", "....#", "####."],
-  T: ["#####", "..#..", "..#..", "..#..", "..#..", "..#..", "..#.."],
-  U: ["#...#", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."],
-  V: ["#...#", "#...#", "#...#", "#...#", "#...#", ".#.#.", "..#.."],
-  W: ["#...#", "#...#", "#...#", "#.#.#", "#.#.#", "##.##", "#...#"],
-  X: ["#...#", "#...#", ".#.#.", "..#..", ".#.#.", "#...#", "#...#"],
-  Y: ["#...#", "#...#", ".#.#.", "..#..", "..#..", "..#..", "..#.."],
-  Z: ["#####", "....#", "...#.", "..#..", ".#...", "#....", "#####"],
-  "0": [".###.", "#...#", "#..##", "#.#.#", "##..#", "#...#", ".###."],
-  "1": ["..#..", ".##..", "..#..", "..#..", "..#..", "..#..", ".###."],
-  "2": [".###.", "#...#", "....#", "...#.", "..#..", ".#...", "#####"],
-  "3": ["#####", "...#.", "..#..", "...#.", "....#", "#...#", ".###."],
-  "4": ["...#.", "..##.", ".#.#.", "#..#.", "#####", "...#.", "...#."],
-  "5": ["#####", "#....", "####.", "....#", "....#", "#...#", ".###."],
-  "6": ["..##.", ".#...", "#....", "####.", "#...#", "#...#", ".###."],
-  "7": ["#####", "....#", "...#.", "..#..", "..#..", "..#..", "..#.."],
-  "8": [".###.", "#...#", "#...#", ".###.", "#...#", "#...#", ".###."],
-  "9": [".###.", "#...#", "#...#", ".####", "....#", "...#.", ".##.."],
-  " ": [".....", ".....", ".....", ".....", ".....", ".....", "....."],
-  a: [".....", ".....", ".###.", "....#", ".####", "#...#", ".####"],
-  b: ["#....", "#....", "####.", "#...#", "#...#", "#...#", "####."],
-  c: [".....", ".....", ".###.", "#...#", "#....", "#...#", ".###."],
-  d: ["....#", "....#", ".####", "#...#", "#...#", "#...#", ".####"],
-  e: [".....", ".....", ".###.", "#...#", "#####", "#....", ".###."],
-  f: ["..##.", ".#...", "####.", ".#...", ".#...", ".#...", ".#..."],
-  g: [".....", ".....", ".####", "#...#", "#...#", "#...#", ".####", "....#", ".###."],
-  h: ["#....", "#....", "####.", "#...#", "#...#", "#...#", "#...#"],
-  i: ["..#..", ".....", ".##..", "..#..", "..#..", "..#..", ".###."],
-  j: ["...#.", ".....", "...#.", "...#.", "...#.", "...#.", "...#.", "#..#.", ".##.."],
-  k: ["#....", "#....", "#..#.", "#.#..", "##...", "#.#..", "#..#."],
-  l: [".##..", "..#..", "..#..", "..#..", "..#..", "..#..", ".###."],
-  m: [".....", ".....", "##.#.", "#.#.#", "#.#.#", "#.#.#", "#.#.#"],
-  n: [".....", ".....", "####.", "#...#", "#...#", "#...#", "#...#"],
-  o: [".....", ".....", ".###.", "#...#", "#...#", "#...#", ".###."],
-  p: [".....", ".....", "####.", "#...#", "#...#", "#...#", "####.", "#....", "#...."],
-  q: [".....", ".....", ".####", "#...#", "#...#", "#...#", ".####", "....#", "....#"],
-  r: [".....", ".....", "#.##.", "##..#", "#....", "#....", "#...."],
-  s: [".....", ".....", ".####", "#....", ".###.", "....#", "####."],
-  t: [".#...", ".#...", "####.", ".#...", ".#...", ".#...", "..##."],
-  u: [".....", ".....", "#...#", "#...#", "#...#", "#...#", ".####"],
-  v: [".....", ".....", "#...#", "#...#", "#...#", ".#.#.", "..#.."],
-  w: [".....", ".....", "#...#", "#...#", "#.#.#", "#.#.#", ".#.#."],
-  x: [".....", ".....", "#...#", ".#.#.", "..#..", ".#.#.", "#...#"],
-  y: [".....", ".....", "#...#", "#...#", "#...#", "#...#", ".####", "....#", ".###."],
-  z: [".....", ".....", "#####", "...#.", "..#..", ".#...", "#####"],
-  ".": [".....", ".....", ".....", ".....", ".....", ".##..", ".##.."],
-  ",": [".....", ".....", ".....", ".....", ".....", ".##..", ".#..."],
-  ":": [".....", ".....", ".##..", ".##..", ".....", ".##..", ".##.."],
-  ";": [".....", ".....", ".##..", ".##..", ".....", ".##..", ".#..."],
-  "!": ["..#..", "..#..", "..#..", "..#..", "..#..", ".....", ".##.."],
-  "?": [".###.", "#...#", "....#", "...#.", "..#..", ".....", ".##.."],
-  "'": ["..#..", "..#..", ".....", ".....", ".....", ".....", "....."],
-  '"': [".#.#.", ".#.#.", ".....", ".....", ".....", ".....", "....."],
-  "-": [".....", ".....", ".....", ".###.", ".....", ".....", "....."],
-  "/": ["....#", "...#.", "...#.", "..#..", ".#...", ".#...", "#...."],
-  "(": ["...#.", "..#..", ".#...", ".#...", ".#...", "..#..", "...#."],
-  ")": [".#...", "..#..", "...#.", "...#.", "...#.", "..#..", ".#..."],
-  "&": [".##..", "#..#.", "#...#", ".##..", "#.#.#", "#..#.", ".##.#"],
-  "%": ["#...#", "...#.", "...#.", "..#..", ".#...", ".#...", "#...#"],
-  "+": [".....", "..#..", "..#..", "#####", "..#..", "..#..", "....."],
-  "=": [".....", ".....", "#####", ".....", "#####", ".....", "....."],
-  "*": ["..#..", "#.#.#", ".###.", "#####", ".###.", "#.#.#", "..#.."],
-  "\u00b7": [".....", ".....", ".....", "..#..", ".....", ".....", "....."],
+const CAP = 100;             // cap height in glyph units
+const XH = 30;               // x-height top
+const DESC = 140;            // descender bottom
+
+const P = (s: string): Pt[] =>
+  s.trim().split(/\s+/).map((t) => {
+    const [a, b] = t.split(",");
+    return [Number(a), Number(b)] as Pt;
+  });
+
+/**
+ * Polyline arc: angles in degrees, 0 = right, 90 = down (y grows downward).
+ * The sweep runs from a0 to a1, so a bowl that bulges to the RIGHT goes
+ * 270 -> 450 (top, right, bottom) and one that bulges to the LEFT goes
+ * 270 -> 90 (top, left, bottom). Full turns run 270 -> -90.
+ */
+const ARC = (cx: number, cy: number, rx: number, ry: number, a0: number, a1: number, n = 12): Pt[] => {
+  const outv: Pt[] = [];
+  for (let i = 0; i <= n; i++) {
+    const a = ((a0 + (a1 - a0) * (i / n)) * Math.PI) / 180;
+    outv.push([cx + rx * Math.cos(a), cy + ry * Math.sin(a)]);
+  }
+  return outv;
 };
+const cat = (...parts: Pt[][]): Pt[] => parts.reduce((acc, p) => acc.concat(p), [] as Pt[]);
+
+type Glyph = { w: number; s: Pt[][] };
+
+/** the alphabet: polylines plus the advance width that goes with each letter */
+const GLYPH: Record<string, Glyph> = {
+  A: { w: 76, s: [P("0,100 32,0 64,100"), P("11,62 53,62")] },
+  B: { w: 82, s: [P("0,0 0,100"),
+                  cat(P("0,0 38,0"), ARC(38, 25, 26, 25, 270, 450, 10), P("38,50 0,50")),
+                  cat(P("0,50 42,50"), ARC(42, 75, 28, 25, 270, 450, 10), P("42,100 0,100"))] },
+  C: { w: 76, s: [ARC(34, 50, 32, 50, 290, 70, 18)] },
+  D: { w: 78, s: [P("0,0 0,100"),
+                  cat(P("0,0 36,0"), ARC(36, 50, 30, 50, 270, 450, 18), P("36,100 0,100"))] },
+  E: { w: 70, s: [P("0,0 0,100"), P("0,0 58,0"), P("0,50 44,50"), P("0,100 58,100")] },
+  F: { w: 70, s: [P("0,0 0,100"), P("0,0 58,0"), P("0,50 44,50")] },
+  G: { w: 80, s: [ARC(34, 50, 34, 50, 290, 26, 20), P("67,71 70,64 70,56 36,56")] },
+  H: { w: 76, s: [P("0,0 0,100"), P("64,0 64,100"), P("0,50 64,50")] },
+  I: { w: 28, s: [P("0,0 0,100")] },
+  J: { w: 74, s: [P("52,0 52,72 46,90 30,100 12,96 2,80")] },
+  K: { w: 76, s: [P("0,0 0,100"), P("58,0 0,58"), P("20,40 62,100")] },
+  L: { w: 68, s: [P("0,0 0,100"), P("0,100 58,100")] },
+  M: { w: 96, s: [P("0,100 0,0 42,64 84,0 84,100")] },
+  N: { w: 78, s: [P("0,100 0,0 66,100 66,0")] },
+  O: { w: 80, s: [ARC(34, 50, 34, 50, 270, -90, 22)] },
+  P: { w: 74, s: [P("0,0 0,100"),
+                  cat(P("0,0 38,0"), ARC(38, 26, 24, 26, 270, 450, 10), P("38,52 0,52"))] },
+  Q: { w: 80, s: [ARC(34, 50, 34, 50, 270, -90, 22), P("42,72 68,104")] },
+  R: { w: 78, s: [P("0,0 0,100"),
+                  cat(P("0,0 38,0"), ARC(38, 26, 24, 26, 270, 450, 10), P("38,52 0,52")),
+                  P("34,52 64,100")] },
+  S: { w: 74, s: [P("62,10 48,1 16,1 4,14 6,30 20,40 48,44 62,54 62,72 50,90 18,90 4,80")] },
+  T: { w: 74, s: [P("0,0 64,0"), P("32,0 32,100")] },
+  U: { w: 76, s: [cat(P("0,0 0,66"), ARC(32, 66, 32, 34, 180, 0, 14), P("64,0"))] },
+  V: { w: 74, s: [P("0,0 32,100 64,0")] },
+  W: { w: 102, s: [P("0,0 20,100 46,34 72,100 92,0")] },
+  X: { w: 74, s: [P("0,0 64,100"), P("64,0 0,100")] },
+  Y: { w: 74, s: [P("0,0 32,54 64,0"), P("32,54 32,100")] },
+  Z: { w: 72, s: [P("0,0 62,0 0,100 62,100")] },
+
+  "0": { w: 74, s: [ARC(31, 50, 31, 50, 270, -90, 20)] },
+  "1": { w: 56, s: [P("10,16 32,2 32,100")] },
+  "2": { w: 72, s: [P("2,20 12,4 34,0 56,6 62,24 56,44 2,100 62,100")] },
+  "3": { w: 72, s: [P("6,8 26,0 48,2 60,16 56,34 36,44 58,54 62,74 50,94 26,100 6,92")] },
+  "4": { w: 74, s: [P("44,100 44,0 2,66 66,66")] },
+  "5": { w: 70, s: [P("58,0 12,0 8,42 24,36 46,38 60,54 56,78 36,96 12,94 2,84")] },
+  "6": { w: 72, s: [P("56,6 34,0 14,12 4,40 4,70 16,92 36,100 54,92 60,72 48,56 26,54 10,66")] },
+  "7": { w: 70, s: [P("2,0 60,0 28,100")] },
+  "8": { w: 72, s: [ARC(31, 25, 29, 25, 270, -90, 14), ARC(31, 75, 31, 25, 270, -90, 14)] },
+  "9": { w: 72, s: [ARC(31, 31, 31, 31, 270, -90, 18), P("62,31 62,68 54,90 34,100")] },
+
+  a: { w: 68, s: [P("54,30 54,100"),
+                  P("54,33 40,29 22,31 8,40 2,54"),
+                  ARC(28, 73, 26, 27, 270, -30, 18)] },
+  b: { w: 68, s: [P("0,0 0,100"), ARC(0, 65, 56, 35, 270, 450, 14)] },
+  c: { w: 62, s: [ARC(26, 65, 26, 35, 290, 70, 14)] },
+  d: { w: 68, s: [P("56,0 56,100"), ARC(56, 65, 56, 35, 270, 90, 14)] },
+  e: { w: 66, s: [P("0,62 54,62"), ARC(27, 65, 27, 35, 55, 335, 16)] },
+  f: { w: 48, s: [P("26,6 18,1 8,10 8,100"), P("0,30 34,30")] },
+  g: { w: 68, s: [ARC(28, 65, 28, 35, 270, -90, 16), P("56,30 56,110 48,130 28,138 10,132 2,118")] },
+  h: { w: 70, s: [P("0,0 0,100"), P("0,72 0,44 10,32 28,32 46,42 52,60 52,100")] },
+  i: { w: 26, s: [P("0,32 0,100"), P("0,4 0,8")] },
+  j: { w: 30, s: [P("16,32 16,112 10,130 0,134"), P("6,4 6,8")] },
+  k: { w: 62, s: [P("0,0 0,100"), P("48,32 0,68"), P("16,56 50,100")] },
+  l: { w: 24, s: [P("0,0 0,100")] },
+  m: { w: 84, s: [P("0,32 0,100"), P("0,48 10,33 26,33 34,46 34,100"), P("34,48 44,33 60,33 68,46 68,100")] },
+  n: { w: 58, s: [P("0,32 0,100"), P("0,48 12,33 30,34 42,48 42,100")] },
+  o: { w: 68, s: [ARC(28, 65, 28, 35, 270, -90, 16)] },
+  p: { w: 68, s: [P("0,32 0,140"), ARC(0, 65, 56, 35, 270, 450, 14)] },
+  q: { w: 68, s: [P("56,32 56,140"), ARC(56, 65, 56, 35, 270, 90, 14)] },
+  r: { w: 50, s: [P("0,32 0,100"), P("0,50 12,35 26,32 36,36")] },
+  s: { w: 58, s: [P("46,38 36,31 14,31 4,40 6,50 18,56 34,58 44,66 42,78 32,90 12,90 2,84")] },
+  t: { w: 50, s: [P("14,8 14,88 22,100 36,98"), P("0,32 34,32")] },
+  u: { w: 58, s: [cat(P("0,32 0,84"), ARC(22, 84, 22, 16, 180, 0, 10), P("44,32"))] },
+  v: { w: 58, s: [P("0,32 23,100 46,32")] },
+  w: { w: 74, s: [P("0,32 13,100 31,54 49,100 62,32")] },
+  x: { w: 58, s: [P("0,32 46,100"), P("46,32 0,100")] },
+  y: { w: 58, s: [P("0,32 22,94"), P("46,32 10,140")] },
+  z: { w: 58, s: [P("0,32 46,32 0,100 46,100")] },
+
+  " ": { w: 36, s: [] },
+  ".": { w: 26, s: [P("1,99 1,100")] },
+  ",": { w: 26, s: [P("1,97 4,100 0,114")] },
+  ":": { w: 26, s: [P("1,56 1,57"), P("1,99 1,100")] },
+  ";": { w: 26, s: [P("1,56 1,57"), P("1,97 4,100 0,114")] },
+  "!": { w: 24, s: [P("1,0 1,66"), P("1,96 1,100")] },
+  "?": { w: 54, s: [P("0,16 8,3 26,0 38,8 42,22 34,38 22,48 20,62"), P("20,96 20,100")] },
+  "'": { w: 18, s: [P("1,0 1,18")] },
+  '"': { w: 32, s: [P("1,0 1,18"), P("14,0 14,18")] },
+  "-": { w: 46, s: [P("0,58 34,58")] },
+  "\u2014": { w: 76, s: [P("0,58 64,58")] },
+  "\u00b7": { w: 30, s: [P("1,56 1,57")] },
+  "/": { w: 56, s: [P("0,100 44,0")] },
+  "(": { w: 34, s: [P("16,0 6,26 6,74 16,100")] },
+  ")": { w: 34, s: [P("0,0 10,26 10,74 0,100")] },
+  "%": { w: 84, s: [P("1,100 52,0"), ARC(14, 20, 12, 16, 270, -90, 12), ARC(42, 80, 12, 16, 270, -90, 12)] },
+  "&": { w: 74, s: [P("54,100 16,34 14,20 22,8 32,12 32,26 20,44 8,66 8,84 18,98 34,100 52,90")] },
+  "+": { w: 60, s: [P("26,30 26,86"), P("0,58 52,58")] },
+  "=": { w: 60, s: [P("0,42 52,42"), P("0,72 52,72")] },
+  "\u00b0": { w: 40, s: [ARC(16, 16, 14, 14, 270, -90, 12)] },
+};
+
+/* ink extents, used to keep serifs inside the letter's own width */
+const BOX: Record<string, { x0: number; x1: number }> = {};
+function inkBox(ch: string) {
+  let b = BOX[ch];
+  if (b) return b;
+  const g = GLYPH[ch];
+  let x0 = 1e9, x1 = -1e9;
+  if (g) for (const st of g.s) for (const pt of st) {
+    if (pt[0] < x0) x0 = pt[0];
+    if (pt[0] > x1) x1 = pt[0];
+  }
+  b = { x0, x1 };
+  BOX[ch] = b;
+  return b;
+}
+
+/* --------------------------------------------------------------- metrics -- */
 
 type TStyle = {
-  sz: number;      // cell height
-  cw?: number;     // cell width (defaults to sz; smaller = condensed)
-  tk?: number;     // tracking, device px
-  be?: number;     // extra stroke weight, device px
+  size: number;        // cap height in page pixels
   color: RGB;
-  a?: number;
+  weight?: number;     // stroke thickness as a fraction of the cap height
+  tk?: number;         // tracking in page pixels
+  acw?: number;        // horizontal condense factor
+  lead?: number;       // extra leading as a fraction of the cap height
+  alpha?: number;
+  serif?: number;      // serif length in glyph units; text sizes carry serifs
 };
 
-/** condensed text size used for body copy, briefs and captions */
-function body(sz: number, color: RGB, tk = 2): TStyle {
-  return { sz, cw: Math.max(2, Math.round(sz * 0.8)), tk, color };
-}
-const cellW = (st: TStyle) => st.cw ?? st.sz;
+const USED = new Set<string>();
 
-/** stroke weight: display sizes get a heavier cut, text sizes stay clean */
-function strokeOf(sz: number) { return sz >= 8 ? 2 : sz >= 6 ? 1 : 0; }
-
-function glyph(ch: string) { return GLYPHS[ch] ?? GLYPHS[" "]; }
-
-function isBlank(ch: string) {
-  const g = glyph(ch);
-  for (const r of g) if (r !== ".....") return false;
-  return true;
-}
-
-function inkBounds(ch: string) {
-  const g = glyph(ch);
-  let lo = 5, hi = -1;
-  for (let r = 0; r < g.length; r++)
-    for (let c = 0; c < 5; c++)
-      if (g[r][c] === "#") { if (c < lo) lo = c; if (c > hi) hi = c; }
-  return { lo, hi };
-}
+const trackOf = (st: TStyle) => (st.tk === undefined ? 0.045 * st.size : st.tk);
 
 function advance(ch: string, st: TStyle) {
-  const tk = st.tk ?? 1;
-  const cw = cellW(st);
-  if (isBlank(ch)) return Math.round(cw * 2.4) + tk;
-  const { lo, hi } = inkBounds(ch);
-  return (hi - lo + 1) * cw + (st.be ?? strokeOf(st.sz)) + tk;
+  const g = GLYPH[ch];
+  const sc = (st.size / CAP) * (st.acw ?? 1);
+  if (!g) { USED.add(ch); return 0.5 * st.size; }
+  return g.w * sc + trackOf(st);
 }
 
 function textW(s: string, st: TStyle) {
   let w = 0;
   for (const ch of s) w += advance(ch, st);
-  return s.length ? w - (st.tk ?? 1) : 0;
+  return s.length ? w - trackOf(st) : 0;
+}
+
+function drawGlyph(ch: string, x: number, y: number, st: TStyle) {
+  const g = GLYPH[ch];
+  if (!g) { USED.add(ch); return; }
+  USED.add(ch);
+  const sc = (st.size / CAP) * (st.acw ?? 1);
+  const sv = st.size / CAP;
+  const th = (st.weight ?? 0.105) * st.size;
+  const a = st.alpha ?? 1;
+  for (const stroke of g.s) {
+    if (stroke.length === 1) { discAA(x + stroke[0][0] * sc, y + stroke[0][1] * sv, th / 2, st.color, a); continue; }
+    const pts: Pt[] = new Array(stroke.length);
+    for (let i = 0; i < stroke.length; i++) pts[i] = [x + stroke[i][0] * sc, y + stroke[i][1] * sv];
+    strokePoly(pts, st.color, th, a);
+  }
+  const sl = st.serif ?? 0;
+  if (sl <= 0) return;
+  // text sizes are serifed: a stem that ends on the cap line, the x-height or the
+  // baseline grows a small crossbar on each side, clamped to the letter's own ink
+  const box = inkBox(ch);
+  for (const stroke of g.s) {
+    if (stroke.length < 2) continue;
+    for (const first of [true, false]) {
+      const end = first ? stroke[0] : stroke[stroke.length - 1];
+      const near = first ? stroke[1] : stroke[stroke.length - 2];
+      if (Math.abs(end[0] - near[0]) > 8) continue;
+      if (Math.abs(end[1] - near[1]) < 22) continue;
+      const atLine = Math.abs(end[1]) < 5 || Math.abs(end[1] - XH) < 5 || Math.abs(end[1] - CAP) < 5;
+      if (!atLine) continue;
+      const sx0 = Math.max(box.x0, end[0] - sl), sx1 = Math.min(box.x1, end[0] + sl);
+      if (sx1 - sx0 < 5) continue;
+      lineAA(x + sx0 * sc, y + end[1] * sv, x + sx1 * sc, y + end[1] * sv, st.color, th * 0.84, a);
+    }
+  }
 }
 
 function drawText(x: number, y: number, s: string, st: TStyle) {
-  const bold = st.be ?? strokeOf(st.sz);      // heavier strokes on display sizes
-  const cw = cellW(st);
   let cx = x;
   for (const ch of s) {
-    const g = glyph(ch);
-    const { lo, hi } = inkBounds(ch);
-    if (hi >= 0)
-      for (let r = 0; r < g.length; r++)
-        for (let c = lo; c <= hi; c++)
-          if (g[r][c] === "#")
-            rect(cx + (c - lo) * cw, y + r * st.sz, cw + bold, st.sz, st.color, st.a ?? 1);
+    if (ch !== " ") drawGlyph(ch, cx, y, st);
     cx += advance(ch, st);
   }
 }
 
 function textCenter(x: number, y: number, w: number, s: string, st: TStyle) {
-  drawText(x + Math.round((w - textW(s, st)) / 2), y, s, st);
+  drawText(x + (w - textW(s, st)) / 2, y, s, st);
 }
 
 function textRight(xr: number, y: number, s: string, st: TStyle) {
   drawText(xr - textW(s, st), y, s, st);
 }
 
-function fitScale(lines: string[], maxW: number, cap: number, tk = 1) {
-  let sz = cap;
-  for (const l of lines) while (sz > 1 && textW(l, { sz, tk, color: INK }) > maxW) sz--;
-  return sz;
-}
+const lh = (st: TStyle) => st.size * (1 + (st.lead === undefined ? 0.42 : st.lead));
 
 function wrapText(s: string, maxW: number, st: TStyle) {
   const words = s.split(/\s+/).filter(Boolean);
@@ -311,378 +477,735 @@ function wrapText(s: string, maxW: number, st: TStyle) {
   return lines;
 }
 
-/** largest size in `sizes` whose wrapped text fits maxH over nCols; never truncates */
-function fitParagraph(text: string, colW: number, maxH: number, sizes: number[], tk: number, nCols: number) {
-  const last = { sz: sizes[sizes.length - 1], lines: [] as string[], per: 0, lh: 0 };
-  for (const sz of sizes) {
-    const st = body(sz, INK, tk);
+/** wrap with a narrower measure for the first `narrow` lines, then the full one */
+function wrapSplit(text: string, narrowW: number, wideW: number, narrow: number, st: TStyle, tk: number) {
+  const words = text.split(/\s+/).filter(Boolean);
+  const lines: string[] = [];
+  let i = 0;
+  while (i < words.length && lines.length < narrow) {
+    let cur = words[i++];
+    while (i < words.length && textW(cur + " " + words[i], st) <= narrowW) cur += " " + words[i++];
+    lines.push(cur);
+  }
+  while (i < words.length) {
+    let cur = words[i++];
+    while (i < words.length && textW(cur + " " + words[i], st) <= wideW) cur += " " + words[i++];
+    lines.push(cur);
+  }
+  return lines;
+}
+
+/** biggest style whose wrapped text fits maxLines inside maxW */
+function fitHead(s: string, maxW: number, sizes: number[], maxLines: number, o: Partial<TStyle>) {
+  let fallback: { st: TStyle; lines: string[] } | null = null;
+  for (const size of sizes) {
+    const st: TStyle = { size, color: INK, ...o, tk: o.tk === undefined ? 0.05 * size : o.tk === -1 ? 0.06 * size : o.tk };
+    const lines = wrapText(s, maxW, st);
+    fallback = { st, lines };
+    if (lines.length <= maxLines && lines.every((l) => textW(l, st) <= maxW)) return fallback;
+  }
+  return fallback!;
+}
+
+type Fit = { size: number; st: TStyle; lines: string[]; per: number; lh: number };
+
+/** biggest size in `sizes` whose wrapped text fits maxH over nCols; never splits a line */
+function fitBody(text: string, colW: number, maxH: number, sizes: number[], nCols: number,
+                 acw = 1, tk?: number) {
+  const last: Fit = { size: sizes[sizes.length - 1], st: { size: sizes[sizes.length - 1], color: INK }, lines: [], per: 0, lh: 0 };
+  for (const size of sizes) {
+    const st: TStyle = { size, acw, tk, color: INK };
     const lines = wrapText(text, colW, st);
     const per = Math.ceil(lines.length / nCols);
-    const lh = sz * 7 + Math.round(sz * 3);
-    last.sz = sz; last.lines = lines; last.per = per; last.lh = lh;
-    if (per * lh <= maxH) return last;
+    const l = lh(st);
+    last.size = size; last.st = st; last.lines = lines; last.per = per; last.lh = l;
+    if (per * l <= maxH) return last;
   }
   return last;
 }
 
-/* ================================================================ 5. content = */
+/** one line set flush to the measure: newspaper copy is justified */
+function drawJust(x: number, y: number, s: string, st: TStyle, targetW: number) {
+  const words = s.split(" ");
+  if (words.length < 2) { drawText(x, y, s, st); return; }
+  const space = advance(" ", st);
+  let wordsW = 0;
+  for (const w of words) wordsW += textW(w, st);
+  const extra = (targetW - wordsW - (words.length - 1) * space) / (words.length - 1);
+  if (extra > space * 1.05) { drawText(x, y, s, st); return; }   // too loose to set
+  let cx = x;
+  for (const w of words) { drawText(cx, y, w, st); cx += textW(w, st) + space + extra; }
+}
 
-const LEAD_HEAD = ["COP31 ENDS", "WITH NO GLOBAL", "CLIMATE DEAL"];
-const LEAD_DECK =
-  "The European Union rejected the closing text over its silence on fossil fuels.";
+function drawPara(x: number, y: number, lines: string[], st: TStyle, step: number, indent = 0, colW = 0) {
+  lines.forEach((l, i) => {
+    const lx = x + (i === 0 ? indent : 0);
+    const last = i === lines.length - 1;
+    if (colW > 0 && !last) drawJust(lx, y + i * step, l, st, colW - (i === 0 ? indent : 0));
+    else drawText(lx, y + i * step, l, st);
+  });
+}
+
+/* ============================================================= 5. pictures = */
+
+type Photo = { w: number; h: number; px: Uint8Array };
+
+function loadPhoto(file: string, w: number, h: number): Photo {
+  const raw = zlib.inflateSync(fs.readFileSync(file));
+  if (raw.length !== w * h * 3) throw new Error(`plate ${file}: ${raw.length} bytes, want ${w * h * 3}`);
+  return { w, h, px: new Uint8Array(raw) };
+}
+
+/** box blur of a raw RGB plate, used as the unsharp reference */
+function blurPlate(p: Photo, radius: number): Float32Array {
+  const { w, h, px } = p;
+  const outv = new Float32Array(w * h * 3);
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      let r = 0, g = 0, b = 0, n = 0;
+      for (let dy = -radius; dy <= radius; dy++) {
+        const yy = y + dy;
+        if (yy < 0 || yy >= h) continue;
+        for (let dx = -radius; dx <= radius; dx++) {
+          const xx = x + dx;
+          if (xx < 0 || xx >= w) continue;
+          const i = (yy * w + xx) * 3;
+          r += px[i]; g += px[i + 1]; b += px[i + 2]; n++;
+        }
+      }
+      const o = (y * w + x) * 3;
+      outv[o] = r / n; outv[o + 1] = g / n; outv[o + 2] = b / n;
+    }
+  return outv;
+}
+
+/** unsharp mask the plate so it still reads as a photograph after enlargement */
+function sharpenPlate(p: Photo, amount: number, radius: number) {
+  const { w, h, px } = p;
+  const ref = blurPlate(p, radius);
+  for (let i = 0; i < w * h * 3; i++) px[i] = clamp(px[i] + amount * (px[i] - ref[i]), 0, 255);
+}
+
+/** lift / gain / saturation / cool shadows, in one pass */
+function gradePlate(p: Photo, lift: number, gain: number, sat: number, cool: number) {
+  const { px } = p;
+  for (let i = 0; i < px.length; i += 3) {
+    let r = px[i], g = px[i + 1], b = px[i + 2];
+    r = lift + gain * r; g = lift + gain * g; b = lift + gain * b;
+    const y = 0.299 * r + 0.587 * g + 0.114 * b;
+    r = y + (r - y) * sat; g = y + (g - y) * sat; b = y + (b - y) * sat;
+    const shadow = 1 - ss01(40, 170, y);                        // only the dark end cools
+    r -= cool * shadow * 6; g += cool * shadow * 2; b += cool * shadow * 9;
+    px[i] = clamp(r, 0, 255); px[i + 1] = clamp(g, 0, 255); px[i + 2] = clamp(b, 0, 255);
+  }
+}
+
+const CR = (t: number): number[] => {
+  const t2 = t * t, t3 = t2 * t;
+  return [
+    0.5 * (-t3 + 2 * t2 - t),
+    0.5 * (3 * t3 - 5 * t2 + 2),
+    0.5 * (-3 * t3 + 4 * t2 + t),
+    0.5 * (t3 - t2),
+  ];
+};
+
+/** Catmull-Rom resample of a sub-rectangle of a plate to dw x dh device pixels */
+function resample(p: Photo, sx0: number, sy0: number, sx1: number, sy1: number, dw: number, dh: number) {
+  const sw = sx1 - sx0, sh = sy1 - sy0;
+  const mid = new Float32Array(dw * sh * 3);
+  for (let y = 0; y < sh; y++) {
+    const sy = clamp(Math.floor(sy0 + y), 0, p.h - 1);
+    const row = sy * p.w * 3;
+    for (let x = 0; x < dw; x++) {
+      const fx = sx0 + ((x + 0.5) / dw) * sw - 0.5;
+      const i0 = Math.floor(fx);
+      const wgt = CR(fx - i0);
+      let r = 0, g = 0, b = 0;
+      for (let k = 0; k < 4; k++) {
+        const xx = clamp(i0 - 1 + k, 0, p.w - 1);
+        const i = row + xx * 3, wk = wgt[k];
+        r += p.px[i] * wk; g += p.px[i + 1] * wk; b += p.px[i + 2] * wk;
+      }
+      const o = (y * dw + x) * 3;
+      mid[o] = r; mid[o + 1] = g; mid[o + 2] = b;
+    }
+  }
+  const outv = new Uint8Array(dw * dh * 3);
+  for (let x = 0; x < dw; x++)
+    for (let y = 0; y < dh; y++) {
+      const fy = ((y + 0.5) / dh) * sh - 0.5;
+      const j0 = Math.floor(fy);
+      const wgt = CR(fy - j0);
+      let r = 0, g = 0, b = 0;
+      for (let k = 0; k < 4; k++) {
+        const yy = clamp(j0 - 1 + k, 0, sh - 1);
+        const i = (yy * dw + x) * 3, wk = wgt[k];
+        r += mid[i] * wk; g += mid[i + 1] * wk; b += mid[i + 2] * wk;
+      }
+      const o = (y * dw + x) * 3;
+      outv[o] = clamp(r, 0, 255) | 0; outv[o + 1] = clamp(g, 0, 255) | 0; outv[o + 2] = clamp(b, 0, 255) | 0;
+    }
+  return outv;
+}
+
+/** place a plate on the page: resample the source band, then paste at device size */
+function plate(p: Photo, sx0: number, sy0: number, sx1: number, sy1: number,
+               x: number, y: number, w: number, h: number) {
+  const prevClip = clipTo(x, y, w, h);
+  const dw = Math.max(1, Math.round(w * SS)), dh = Math.max(1, Math.round(h * SS));
+  const buf = resample(p, sx0, sy0, sx1, sy1, dw, dh);
+  const X0 = Math.round(x * SS), Y0 = Math.round(y * SS);
+  const col: RGB = [0, 0, 0];
+  for (let j = 0; j < dh; j++) {
+    const yd = Y0 + j;
+    if (yd < 0 || yd >= DH) continue;
+    for (let i = 0; i < dw; i++) {
+      const xd = X0 + i;
+      if (xd < 0 || xd >= DW) continue;
+      const s = (j * dw + i) * 3;
+      col[0] = buf[s]; col[1] = buf[s + 1]; col[2] = buf[s + 2];
+      putD(xd, yd, col, 1);
+    }
+  }
+  CLIP = prevClip;
+}
+
+/** a small credit strip printed inside a dark plate, bottom left, with a scrim */
+function plateCredit(x: number, y: number, w: number, h: number, text: string) {
+  const st: TStyle = { size: 16, color: WHITE, weight: 0.13, tk: 1.5, alpha: 0.92 };
+  const tw = textW(text, st);
+  const bx = x + 12, by = y + h - 12 - 16;
+  rect(bx - 6, by - 5, tw + 12, 26, [8, 11, 16], 0.42);
+  drawText(bx, by, text, st);
+}
+
+/** source rectangle that covers a w x h box from a plate, centre-weighted */
+function cover(p: Photo, w: number, h: number, bias = 0.5): [number, number, number, number] {
+  const ta = w / h, sa = p.w / p.h;
+  if (sa > ta) { const cw = p.h * ta; const sx = (p.w - cw) * 0.5; return [sx, 0, sx + cw, p.h]; }
+  const ch = p.w / ta;
+  const sy = (p.h - ch) * bias;
+  return [0, sy, p.w, sy + ch];
+}
+
+const COP31 = loadPhoto("assets/hero_cop31.rgb.z", 900, 514);
+const CAPITOL = loadPhoto("assets/hero_capitol.rgb.z", 420, 420);
+sharpenPlate(COP31, 0.55, 1);
+sharpenPlate(CAPITOL, 0.5, 1);
+gradePlate(COP31, 14, 1.34, 0.92, 1);
+gradePlate(CAPITOL, 6, 1.12, 1.06, 0.4);
+
+/* ============================================================== 6. content = */
+
+const LEAD_HEAD = "COP31 ENDS WITHOUT A CLIMATE DEAL";
+const LEAD_DECK = "The European Union refused to sign a text that never named fossil fuels.";
 const LEAD_BODY =
-  "Negotiators sat through two extra days of talks, far past the deadline, before the gavel fell. The closing text dropped every mention of coal, oil and gas, and the summit ended without an agreed outcome. The mood in the hall soured in the final hours. A small group of states now carries the work into January.";
-const LEAD_CAP = "The summit closed with no agreed text after two weeks of talks in Brasilia.";
-const LEAD_CREDIT = "GRAPHIC: THE WORLD";
+  "The gavel fell two days late and the summit closed with no agreed outcome. The final draft dropped every " +
+  "mention of coal, oil and gas, and the European Union refused to sign it. Work now moves to January.";
+const LEAD_CAP = "The closing session ran two days past the deadline.";
+const LEAD_CREDIT = "PHOTOGRAPH: THE WORLD";
 
-const SIDE_ITEMS = [
+const SIDE_ITEMS: {
+  kicker: string; head: string; body: string; art: "capitol" | "ship" | "chart";
+  artH: number; caption: string; credit: string;
+}[] = [
   {
     kicker: "UNITED STATES",
-    head: ["DEMOCRATS", "TAKE THE HOUSE", "IN A LANDSLIDE"],
-    body: "The party wins its widest House majority in three decades, a blow to President Trump.",
-    photo: false,
+    head: "DEMOCRATS TAKE THE HOUSE",
+    body: "Widest House majority in three decades \u2014 a blow to President Trump.",
+    art: "capitol", artH: 176,
+    caption: "The Capitol at dusk.",
+    credit: "PHOTOGRAPH: THE WORLD",
   },
   {
     kicker: "GULF OF FINLAND",
-    head: ["FIRE ABOARD", "A RUSSIAN SHIP"],
-    body: "The Sparta II was ablaze off Finland on Sunday night.",
-    photo: true,
+    head: "FIRE ABOARD A RUSSIAN SHIP",
+    body: "The Sparta II burned off Finland late on Sunday; the crew was taken off by tugs.",
+    art: "ship", artH: 150,
+    caption: "The Gulf of Finland, Sunday night.",
+    credit: "GRAPHIC: THE WORLD",
   },
   {
     kicker: "DEMOGRAPHY",
-    head: ["ISLAM TO PASS", "CHRISTIANITY"],
-    body: "A new report projects it will be the largest faith in the world by 2035.",
-    photo: false,
+    head: "ISLAM TO PASS CHRISTIANITY",
+    body: "A report projects Islam as the largest faith in the world by 2035.",
+    art: "chart", artH: 198,
+    caption: "",
+    credit: "PROJECTION: THE WORLD DESK",
   },
 ];
 
 const TICKER = [
-  { reg: "UKRAINE", txt: "An overnight attack on the Kyiv region left two dead in the rubble and four wounded." },
-  { reg: "WEST BANK", txt: "Settlers attacked Palestinian villages across the occupied West Bank late on Sunday." },
-  { reg: "HAITI", txt: "Two soldiers from El Salvador were killed and two wounded on duty in the country." },
-  { reg: "CHINA", txt: "Beijing set 2030 targets for elderly care and for childcare places nationwide." },
+  { reg: "UKRAINE", txt: "An overnight attack on the Kyiv region left two dead and four wounded, local officials said. Air defences stayed busy until dawn." },
+  { reg: "WEST BANK", txt: "Settlers attacked Palestinian villages across the occupied West Bank late on Sunday, residents and medics reported." },
+  { reg: "HAITI", txt: "Two Salvadoran soldiers on a security mission were killed and two were wounded in the country, the army said." },
+  { reg: "CHINA", txt: "Beijing set 2030 targets for elderly care and for childcare places across the country, as the population ages." },
 ];
 
-/* ============================================================= 6. the page == */
+/* =============================================================== 7. charts = */
+/* A projected pair of lines on paper stock: hairline rules, small type.        */
 
-function drawPaper() {
-  gradRect(0, 0, W, H, PAPER_HI, PAPER_LO);
-  for (let y = 0; y < H; y++) {
-    const dy = (y / (H - 1)) * 2 - 1;
-    for (let x = 0; x < W; x++) {
-      const dx = (x / (W - 1)) * 2 - 1;
-      const d = Math.hypot(dx, dy) / 1.4142;
-      const v = Math.max(0, d - 0.55) / 0.45;
-      if (v > 0) px(x, y, [184, 164, 130], Math.min(0.22, v * 0.22));
+function chartArt(x: number, y: number, w: number, h: number) {
+  const cap: TStyle = { size: 21, color: INK_SOFT, weight: 0.115, tk: 1.6 };
+  const lbl: TStyle = { size: 20, color: INK_2, weight: 0.12, tk: 1.4 };
+
+  drawText(x, y, "BILLIONS", cap);
+  textRight(x + w, y, "PROJECTED", cap);
+
+  // legend sits on its own line, above the plot, where nothing can run into it
+  const legY = y + 32;
+  rect(x, legY + 8, 20, 2.6, BRICK);
+  drawText(x + 29, legY, "ISLAM", { size: 21, color: BRICK_DK, weight: 0.16, tk: 1.8 });
+  rect(x + 118, legY + 8, 20, 2.6, TEAL);
+  drawText(x + 147, legY, "CHRISTIANITY", { size: 21, color: TEAL, weight: 0.16, tk: 1.8 });
+
+  const padL = 46, padR = 18, padT = 68, padB = 32;
+  const px0 = x + padL, px1 = x + w - padR, py0 = y + padT, py1 = y + h - padB;
+  const yearX = (yr: number) => px0 + ((yr - 2000) / 50) * (px1 - px0);
+  const valY = (v: number) => py1 - ((v - 1) / 2.2) * (py1 - py0);
+
+  for (const v of [2, 3]) {
+    const yy = valY(v);
+    for (let i = 0; i < px1 - px0; i += 7) rect(px0 + i, yy, 4, 1, HAIR);
+    drawText(px0 - 9 - textW(String(v), lbl), yy - 20 * 0.62, String(v), lbl);
+  }
+
+  const series: Pt[] = [[2000, 1.24], [2008, 1.50], [2016, 1.78], [2024, 2.05], [2030, 2.28], [2035, 2.42], [2042, 2.64], [2050, 2.86]]
+    .map(([yr, v]) => [yearX(yr), valY(v)] as Pt);
+  const other: Pt[] = [[2000, 2.02], [2008, 2.10], [2016, 2.18], [2024, 2.26], [2030, 2.34], [2035, 2.40], [2042, 2.46], [2050, 2.52]]
+    .map(([yr, v]) => [yearX(yr), valY(v)] as Pt);
+
+  poly([...series, [px1, py1], [px0, py1]], BRICK, 0.09);
+
+  rect(px0, py1, px1 - px0, 1.3, INK_2, 0.8);
+  for (const yr of [2000, 2020, 2035, 2050]) {
+    rect(yearX(yr), py1, 1, 4, INK_2, 0.8);
+    const st: TStyle = { size: 19, color: yr === 2035 ? BRICK_DK : INK_2, weight: 0.125, tk: 1.2 };
+    const s = String(yr);
+    let lx = yearX(yr) - textW(s, st) / 2;
+    lx = clamp(lx, x + 3, x + w - 3 - textW(s, st));
+    drawText(lx, py1 + 9, s, st);
+  }
+  for (let yy = py0 + 2; yy < py1; yy += 7) rect(yearX(2035), yy, 1, 4, BRICK, 0.45);
+
+  const curve = (pts: Pt[], col: RGB, th: number) => {
+    for (let i = 0; i + 1 < pts.length; i++) lineAA(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1], col, th);
+  };
+  curve(other, TEAL, 1.6);
+  curve(series, BRICK, 1.8);
+
+  discAA(yearX(2034), valY(2.41), 5.5, [245, 239, 228], 1);
+  discAA(yearX(2034), valY(2.41), 2.6, BRICK, 1);
+}
+
+/* ============================================================ 8. ship plate = */
+/* An illustration, not a photograph: the burning Sparta II, drawn in flat ink and
+   ember colour so it sits with the type rather than with the pictures.           */
+
+function shipArt(x: number, y: number, w: number, h: number) {
+  const prevClip = clipTo(x, y, w, h);
+  const sea = y + h * 0.70;
+  rect(x, y, w, h, INK);
+  gradV(x, y, w, sea - y, [
+    [0, [16, 21, 31]], [0.4, [44, 36, 39]], [0.72, [126, 62, 38]], [1, [178, 108, 56]],
+  ]);
+  const fx = x + w * 0.46;
+  shadeRect(x, y, w, sea - y, (u, v, xl, yl) => {
+    const d = Math.hypot(xl - fx, (yl - sea) * 1.5) / (w * 0.55);
+    if (d >= 1) return false;
+    const g = Math.pow(1 - d, 2.2);
+    SHADE[0] = 255; SHADE[1] = 150; SHADE[2] = 62; SHADE[3] = g * 0.55;
+    return true;
+  });
+  for (let k = 0; k < 5; k++) {
+    const ox = x + w * (0.54 + k * 0.075);
+    for (let t = 0; t < 1; t += 0.01) {
+      const py = sea - (sea - y) * t * 0.94;
+      const pxx = ox + Math.sin(t * 3.4 + k) * w * 0.06 + t * w * 0.12;
+      const r = w * (0.035 + t * 0.135 + k * 0.005);
+      const amt = (1 - t * 0.75) * 0.075;
+      discAA(pxx, py, r, [116, 114, 118], amt);
+      discAA(pxx + r * 0.4, py, r * 0.7, [96, 96, 104], amt * 0.7);
+      discAA(pxx - r * 0.4, py, r * 0.7, [158, 138, 124], amt * 0.5);
+    }
+  }
+  gradV(x, sea, w, y + h - sea, [[0, [42, 50, 60]], [0.5, [26, 32, 42]], [1, [12, 16, 24]]]);
+  for (let j = 0; j < y + h - sea; j++)
+    for (let i = 0; i < w; i++) {
+      const u = (i - (fx - x)) / (w * 0.26);
+      if (Math.abs(u) > 1) continue;
+      const refl = Math.max(0, 1 - Math.abs(u)) * Math.max(0, 1 - j / ((y + h - sea) * 1.6));
+      const rip = 0.55 + 0.45 * Math.sin(j * 1.7 + i * 0.21);
+      rect(x + i, sea + j, 1, 1, [255, 148, 62], refl * rip * 0.7);
+    }
+
+  const hullTop = sea - h * 0.16;
+  const hull: RGB = [11, 13, 18];
+  poly([[x + w * 0.14, hullTop], [x + w * 0.88, hullTop], [x + w * 0.82, sea + 1], [x + w * 0.20, sea + 1]], hull);
+  poly([[x + w * 0.18, hullTop - h * 0.016], [x + w * 0.85, hullTop - h * 0.016],
+        [x + w * 0.86, hullTop + h * 0.010], [x + w * 0.17, hullTop + h * 0.010]], hull);
+  rect(x + w * 0.26, hullTop - h * 0.15, w * 0.17, h * 0.15, hull);
+  rect(x + w * 0.60, hullTop - h * 0.10, w * 0.09, h * 0.10, hull);
+  rect(x + w * 0.29, hullTop - h * 0.34, w * 0.022, h * 0.34, hull);
+  rect(x + w * 0.275, hullTop - h * 0.28, w * 0.07, h * 0.014, hull);
+  rect(x + w * 0.44, hullTop - h * 0.12, w * 0.014, h * 0.12, hull);
+  for (let k = 0; k < 4; k++)
+    rect(x + w * 0.285 + k * w * 0.036, hullTop - h * 0.11, w * 0.014, h * 0.05, [8, 9, 13]);
+
+  const fb = hullTop + h * 0.05;
+  const fcx = x + w * 0.42;
+  for (const [dx, hh, ww, col, al] of [
+    [-0.13, 0.48, 0.11, [176, 58, 38], 0.95], [-0.04, 0.74, 0.12, [214, 92, 38], 0.95],
+    [0.04, 0.98, 0.12, [238, 128, 44], 0.95], [0.12, 0.66, 0.10, [252, 176, 62], 0.95],
+    [0.19, 0.40, 0.08, [255, 226, 140], 0.95],
+  ] as [number, number, number, RGB, number][]) {
+    const bx = fcx + w * dx, th = h * 0.52 * hh, half = (w * ww) / 2;
+    const L: Pt[] = [], R: Pt[] = [];
+    const N = 20;
+    for (let i = 0; i <= N; i++) {
+      const t = i / N;
+      const taper = Math.pow(1 - t, 0.45);
+      const lean = w * 0.05 * t * t + Math.sin(t * 2.4 + dx * 12) * half * 0.7 * t;
+      const wob = (Math.sin(t * 7.5 + dx * 30) * 0.5 + 0.5) * half * 0.7;
+      const w2 = half * taper + wob * (1 - t * t);
+      const yy = fb - th * t;
+      L.push([bx + lean - w2, yy]);
+      R.push([bx + lean + w2, yy]);
+    }
+    poly([...L, ...R.slice().reverse()], col, al);
+  }
+  for (let j = 0; j < h * 0.07; j++) {
+    const w2 = w * 0.10 * (1 - j / (h * 0.07));
+    rect(fcx - w2, fb - j, w2 * 2, 1.15, [255, 244, 208], 0.9);
+  }
+  for (const [dx, hh] of [[0.30, 0.22], [-0.24, 0.18]] as [number, number][]) {
+    const bx = fcx + w * dx, th = h * 0.52 * hh;
+    const L: Pt[] = [], R: Pt[] = [];
+    const N = 14;
+    for (let i = 0; i <= N; i++) {
+      const t = i / N;
+      const w2 = w * 0.013 * Math.pow(1 - t, 0.55);
+      const yy = fb - th * t;
+      const cx = bx + Math.sin(t * 3.1 + dx * 20) * w * 0.04 * t;
+      L.push([cx - w2, yy]);
+      R.push([cx + w2, yy]);
+    }
+    poly([...L, ...R.slice().reverse()], [255, 198, 96], 0.85);
+  }
+  rect(x + w * 0.15, hullTop - h * 0.02, w * 0.70, 2, [255, 158, 78], 0.5);
+  rect(x + w * 0.26, hullTop - h * 0.15, w * 0.17, 2, [255, 170, 90], 0.4);
+  for (const [sx2, sy2, r] of [[0.38, 0.28, 2], [0.52, 0.14, 2], [0.31, 0.40, 2], [0.58, 0.42, 2], [0.45, 0.08, 1]] as [number, number, number][])
+    discAA(x + w * sx2, y + h * sy2, r, [255, 236, 176], 0.95);
+  for (let k = 0; k < 12; k++)
+    rect(x + ((k * 137) % (w - 70)), sea + 2 + k * 2, 20 + ((k * 53) % 70), 1, [255, 176, 96], 0.28);
+
+  rect(x, y, w, 2, INK);
+  rect(x, y + h - 2, w, 2, INK);
+  rect(x, y, 2, h, INK);
+  rect(x + w - 2, y, 2, h, INK);
+  CLIP = prevClip;
+}
+
+/* ============================================================= 9. the page = */
+
+const SIZE = {
+  folio: 21,
+  title: 124,
+  date: 38,
+  strap: 29,
+  kicker: 32,
+  deck: 39,
+  byline: 25,
+  caption: 23,
+  credit: 19,
+  body: 41,
+  sideKick: 25,
+  sideHead: 39,
+  sideBody: 29,
+  briefReg: 28,
+  briefBody: 30,
+};
+
+function paperTex() {
+  for (let j = 0; j < H; j++) {
+    const c = ramp([[0, PAPER_HI], [0.55, PAPER], [1, PAPER_LO]], j / (H - 1));
+    for (let i = 0; i < W; i++) {
+      const dx = ((i + 0.5) / W) * 2 - 1, dy = ((j + 0.5) / H) * 2 - 1;
+      const d = Math.sqrt(dx * dx + dy * dy) / 1.4142;
+      const v = Math.max(0, (d - 0.70) / 0.30);
+      const a = Math.min(0.03, v * 0.03);
+      const x0 = i * SS, y0 = j * SS;
+      for (let sy = 0; sy < SS; sy++)
+        for (let sx = 0; sx < SS; sx++) {
+          const k = ((y0 + sy) * DW + x0 + sx) * 4;
+          dev[k] = c[0] + (180 - c[0]) * a;
+          dev[k + 1] = c[1] + (160 - c[1]) * a;
+          dev[k + 2] = c[2] + (126 - c[2]) * a;
+        }
     }
   }
 }
 
 function drawMasthead() {
-  rect(M, 56, CONTENT, 5, INK);
+  rect(M, 54, CONTENT, 5, INK);
+  const folio: TStyle = { size: SIZE.folio, color: INK_SOFT, weight: 0.13, tk: 2.6 };
+  drawText(M, 68, "VOL. CXIV  \u00b7  NO. 41,902", folio);
+  textRight(M + CONTENT, 68, "WORLD DESK  \u00b7  EVENING EDITION", folio);
 
-  const folioL = "VOL. I  \u00b7  NO. 187";
-  const folioR = "WORLD DESK  \u00b7  EVENING EDITION";
-  const fs: TStyle = { sz: 3, tk: 2, color: INK_SOFT };
-  drawText(M, 70, folioL, fs);
-  textRight(M + CONTENT, 70, folioR, fs);
+  const titleSt: TStyle = { size: SIZE.title, color: INK, weight: 0.18, tk: 0.075 * SIZE.title };
+  const tw = textW("THE WORLD", titleSt);
+  textCenter(M, 96, CONTENT, "THE WORLD", titleSt);
+  const tx0 = M + (CONTENT - tw) / 2;
+  rect(M, 96 + SIZE.title * 0.44, Math.max(0, tx0 - M - 28), 2, HAIR);
+  rect(tx0 + tw + 28, 96 + SIZE.title * 0.44, Math.max(0, M + CONTENT - (tx0 + tw + 28)), 2, HAIR);
 
-  const title = "THE WORLD";
-  const tsz = fitScale([title], CONTENT - 160, 17);
-  textCenter(M, 98, CONTENT, title, { sz: tsz, tk: 2, color: INK });
+  rect(M, 240, CONTENT, 4, INK);
+  rect(M, 247, CONTENT, 1.4, INK, 0.5);
 
-  textCenter(M, 230, CONTENT, "SUNDAY 22 NOVEMBER 2026", { sz: 5, tk: 2, color: INK });
+  const dateSt: TStyle = { size: SIZE.date, color: INK, weight: 0.145, tk: 3.1 };
+  const dw = textW("SUNDAY 22 NOVEMBER 2026", dateSt);
+  const dateY = 256;
+  textCenter(M, dateY, CONTENT, "SUNDAY 22 NOVEMBER 2026", dateSt);
+  const rx = M + (CONTENT - dw) / 2;
+  rect(M, dateY + SIZE.date * 0.72, Math.max(0, rx - M - 22), 2, HAIR);
+  rect(rx + dw + 22, dateY + SIZE.date * 0.72, Math.max(0, M + CONTENT - (rx + dw + 22)), 2, HAIR);
 
-  rect(M, 270, CONTENT, 2, TEAL);
-  textCenter(M, 278, CONTENT,
+  rect(M, 306, CONTENT, 2.4, TEAL);
+  textCenter(M, 314, CONTENT,
     "KYIV HIT OVERNIGHT  \u00b7  SETTLER ATTACKS  \u00b7  CHINA SETS 2030 CARE GOALS",
-    { sz: 4, cw: 3, tk: 3, be: 1, color: INK });
-  rect(M, 312, CONTENT, 4, INK);
+    { size: SIZE.strap, color: INK, weight: 0.125, tk: 3.4 });
+  rect(M, LEAD_TOP - 12, CONTENT, 5, INK);
+  report("masthead", 54, LEAD_TOP - 7, LEAD_TOP, "nameplate " + Math.round(tw) + "px");
 }
 
-/* --- the globe: meridians, parallels, and a cracked, overheating flank ---- */
-function drawGlobe(x: number, y: number, w: number, h: number) {
-  for (let j = 0; j < h; j++)
-    for (let i = 0; i < w; i++) {
-      const tx = i / (w - 1), ty = j / (h - 1);
-      const cool = mix([11, 18, 25], [19, 36, 40], ty);
-      const warm = mix([20, 18, 20], [92, 36, 22], ty);
-      px(x + i, y + j, mix(cool, warm, Math.pow(tx, 1.8)));
-    }
-  for (let j = 0; j < h; j += 4)
-    for (let i = 0; i < w; i++) px(x + i, y + j, [130, 200, 200], 0.045);
-
-  const cx = x + w * 0.5, cy = y + h * 0.5, R = h * 0.42;
-
-  for (const k of [1.6, 1.95, 2.35]) ring(cx, cy, R * k, [120, 205, 205], 1, 0.10);
-  ring(cx, cy, R + 11, [255, 152, 92], 7, 0.055);
-  ring(cx, cy, R + 5, [110, 205, 200], 3, 0.10);
-
-  for (let j = -R; j <= R; j++)
-    for (let i = -R; i <= R; i++) {
-      if (i * i + j * j > R * R) continue;
-      const nx = i / R, ny = j / R;
-      const nz = Math.sqrt(Math.max(0, 1 - nx * nx - ny * ny));
-      const sh = Math.max(0.20, (0.26 + 0.86 * Math.max(0, nz * 0.72 - nx * 0.36 - ny * 0.34)) / 1.1);
-      const warm = Math.max(0, Math.min(1, (nx + 0.12) / 0.95));
-      const base = mix([46, 112, 116], [206, 88, 46], Math.pow(warm, 1.4));
-      px(Math.round(cx + i), Math.round(cy + j), [
-        Math.min(255, base[0] * sh * (1 + warm * 0.55)), base[1] * sh, base[2] * sh,
-      ], 0.95);
-    }
-
-  for (const deg of [-75, -50, -25, 0, 25, 50, 75]) {
-    const a = Math.abs(R * Math.sin((deg * Math.PI) / 180));
-    for (let t = 0; t <= 900; t++) {
-      const th = (t / 900) * Math.PI * 2;
-      const gx = Math.round(cx + a * Math.cos(th)), gy = Math.round(cy + R * Math.sin(th));
-      px(gx, gy, [180, 240, 234], 0.33);
-      px(gx, gy + 1, [180, 240, 234], 0.16);
-    }
-  }
-  for (const deg of [-62, -32, 0, 32, 62]) {
-    const ph = (deg * Math.PI) / 180;
-    const yy = cy - R * Math.sin(ph), half = R * Math.cos(ph);
-    for (let i = -half; i <= half; i++) px(Math.round(cx + i), Math.round(yy), [180, 240, 234], 0.29);
-  }
-  ring(cx, cy, R, [196, 248, 242], 1.6, 0.95);
-  ring(cx, cy, R - 3, [12, 26, 30], 1, 0.45);
-
-  // heat wash on the sunward flank
-  for (let j = -R; j <= R; j++)
-    for (let i = -R; i <= R; i++) {
-      if (i * i + j * j > R * R) continue;
-      const heat = Math.max(0, Math.min(1, (i / R + 0.05) / 0.95));
-      if (heat <= 0.02) continue;
-      const streak = ((i * 5 + j * 3) % 9 + 9) % 9;
-      px(Math.round(cx + i), Math.round(cy + j), [255, 138, 62], heat * (streak < 2 ? 0.5 : 0.22));
-    }
-
-  const cracks: number[][][] = [
-    [[-8, -R * 0.9], [4, -R * 0.62], [-4, -R * 0.34], [8, -R * 0.08], [0, R * 0.18], [10, R * 0.44], [3, R * 0.72], [11, R * 0.94]],
-    [[4, -R * 0.62], [R * 0.36, -R * 0.56], [R * 0.58, -R * 0.68], [R * 0.86, -R * 0.52]],
-    [[8, -R * 0.08], [R * 0.44, -R * 0.02], [R * 0.7, R * 0.14], [R * 0.92, R * 0.04]],
-    [[0, R * 0.18], [-R * 0.3, R * 0.32], [-R * 0.22, R * 0.52], [-R * 0.46, R * 0.64]],
-    [[10, R * 0.44], [R * 0.32, R * 0.58], [R * 0.52, R * 0.5]],
-  ];
-  for (const path of cracks)
-    for (let i = 0; i < path.length - 1; i++) {
-      const [ax, ay] = path[i], [bx, by] = path[i + 1];
-      line(cx + ax, cy + ay, cx + bx, cy + by, [26, 14, 10], 3, 0.9);
-      line(cx + ax, cy + ay, cx + bx, cy + by, [255, 196, 126], 1, 0.55);
-    }
-  for (const [sx, sy, r] of [
-    [R * 0.72, -R * 0.64, 4], [R * 0.88, -R * 0.12, 3], [R * 0.6, R * 0.52, 4], [R * 0.3, R * 0.8, 3],
-  ] as [number, number, number][]) {
-    disc(cx + sx, cy + sy, r, [255, 186, 112], 0.55);
-    disc(cx + sx, cy + sy, 1, [255, 250, 235], 1);
-  }
-
-  halftone(x + 3, y + 3, w - 6, h - 6, 10);
-  rect(x, y, w, 3, INK);
-  rect(x, y + h - 3, w, 3, INK);
-  rect(x, y, 3, h, INK);
-  rect(x + w - 3, y, 3, h, INK);
-}
-
-/* --- photo strip: a ship burning at sea (colour blocks + silhouette) ------ */
-function drawFireStrip(x: number, y: number, w: number, h: number) {
-  const sea = y + Math.round(h * 0.76);
-  gradRect(x, y, w, sea - y, [30, 40, 52], [128, 64, 38]);
-  gradRect(x, sea, w, y + h - sea, [34, 44, 54], [16, 22, 30]);
-
-  for (let j = 0; j < sea - y; j++)
-    for (let i = 0; i < w; i++) {
-      const d = Math.hypot(i - w * 0.5, (j - (sea - y) * 0.68) * 1.35) / (w * 0.46);
-      const a = Math.max(0, 1 - d) ** 2 * 0.8;
-      if (a > 0.01) px(x + i, y + j, [255, 142, 54], a);
-    }
-
-  for (const [sx, sy, r, a] of [
-    [0.66, 0.18, 24, 0.26], [0.74, 0.11, 18, 0.22], [0.82, 0.06, 13, 0.16], [0.6, 0.28, 18, 0.16],
-  ] as [number, number, number, number][])
-    disc(x + w * sx, y + h * sy, r, [104, 104, 108], a);
-
-  const hullTop = sea - Math.round(h * 0.2);
-  poly([[x + w * 0.19, hullTop], [x + w * 0.84, hullTop], [x + w * 0.78, sea], [x + w * 0.25, sea]], [10, 14, 18]);
-  rect(x + w * 0.27, hullTop - 2, Math.round(w * 0.56), 3, [10, 14, 18]);
-  rect(x + w * 0.44, hullTop - Math.round(h * 0.19), Math.round(w * 0.14), Math.round(h * 0.19), [10, 14, 18]);
-  rect(x + w * 0.61, hullTop - Math.round(h * 0.13), Math.round(w * 0.05), Math.round(h * 0.13), [10, 14, 18]);
-  rect(x + w * 0.332, hullTop - Math.round(h * 0.3), 3, Math.round(h * 0.3), [10, 14, 18]);
-  rect(x + w * 0.3, hullTop - Math.round(h * 0.22), 14, 2, [10, 14, 18]);
-  // rim light along the deck, cast by the blaze
-  rect(x + w * 0.2, hullTop - 1, Math.round(w * 0.63), 2, [255, 152, 74], 0.5);
-
-  const fx = x + w * 0.5, fy = hullTop - 1;
-  for (const [dx, hh, ww, col] of [
-    [-0.09, 0.78, 0.13, [190, 66, 44]], [0.02, 1.15, 0.15, [236, 108, 42]],
-    [0.12, 0.9, 0.12, [250, 158, 56]], [0.2, 0.6, 0.09, [255, 214, 120]],
-  ] as [number, number, number, RGB][]) {
-    const bx = fx + w * dx, th = h * 0.3 * hh, half = (w * ww) / 2;
-    poly([[bx - half, fy], [bx + half, fy], [bx + half - 3, fy - th * 0.5], [bx, fy - th], [bx - half + 3, fy - th * 0.45]], col);
-  }
-  for (const [sx, sy, r] of [[0.42, 0.3, 2], [0.56, 0.18, 2], [0.34, 0.42, 2], [0.61, 0.44, 2]] as [number, number, number][])
-    disc(x + w * sx, y + h * sy, r, [255, 236, 176], 0.95);
-
-  for (let j = 0; j < y + h - sea; j++)
-    for (let i = 0; i < w; i++) {
-      const u = (i - w * 0.46) / (w * 0.22);
-      const a = Math.max(0, 1 - Math.abs(u)) * Math.max(0, 1 - j / (y + h - sea)) * 0.75;
-      if (a > 0.01) px(x + i, sea + j, [255, 142, 60], a);
-    }
-  for (let k = 0; k < 10; k++)
-    rect(x + ((k * 131) % (w - 60)), sea + 3 + k * 2, 24 + ((k * 47) % 70), 1, [12, 18, 24], 0.4);
-
-  halftone(x + 3, y + 3, w - 6, h - 6, 10);
-  rect(x, y, w, 3, INK);
-  rect(x, y + h - 3, w, 3, INK);
-  rect(x, y, 3, h, INK);
-  rect(x + w - 3, y, 3, h, INK);
-}
-
-/* --- lead package --------------------------------------------------------- */
 function drawLead() {
   const x = M, w = LEAD_W;
   let y = LEAD_TOP;
 
-  const kw = textW("CLIMATE", { sz: 6, tk: 2, color: WHITE });
-  rect(x, y, kw + 40, 46, BRICK);
-  drawText(x + 20, y + 2, "CLIMATE", { sz: 6, tk: 2, color: WHITE });
-  rect(x + kw + 54, y + 22, w - kw - 54, 2, TEAL);
+  const kSt: TStyle = { size: SIZE.kicker, color: WHITE, weight: 0.155, tk: 2.8 };
+  const kw = textW("CLIMATE", kSt);
+  const kh = SIZE.kicker + 18;
+  rect(x, y, kw + 36, kh, BRICK);
+  drawText(x + 18, y + 9, "CLIMATE", kSt);
+  drawText(x + kw + 56, y + 3, "THE SUMMIT COLLAPSES IN OVERTIME",
+    { size: 28, color: INK_SOFT, weight: 0.12, tk: 2.0 });
+  rect(x + kw + 56, y + 3 + 28 + 10, w - kw - 56, 1.4, HAIR);
+  y += kh + 16;
+  rect(x, y, w, 2.4, TEAL);
+  y += 16;
 
-  y += 46 + 24;
-  const hsz = fitScale(LEAD_HEAD, w, 13, 4);
-  const hlh = hsz * 7 + Math.round(hsz * 2);
-  for (const l of LEAD_HEAD) { drawText(x, y, l, { sz: hsz, tk: 4, color: INK }); y += hlh; }
-  y -= Math.round(hsz * 0.7);
-  rect(x, y, w, 4, INK);
-  y += 30;
+  const photoH = 782;
+  leadPhoto(x, y, w, photoH);
+  y += photoH;
 
-  const dSt: TStyle = { sz: 5, cw: 4, tk: 2, be: 1, color: INK };
-  for (const l of wrapText(LEAD_DECK, w, dSt)) { drawText(x, y, l, dSt); y += 5 * 7 + 14; }
-  y += 18;
+  drawText(x, y + 10, LEAD_CAP, { size: SIZE.caption, color: INK_SOFT, weight: 0.115, tk: 1.6, serif: 10 });
+  y += 10 + 28;
 
+  const dSt: TStyle = { size: SIZE.deck, color: INK_2, weight: 0.115, tk: 1.9, lead: 0.44, serif: 11 };
+  const deckLines = wrapText(LEAD_DECK, w - 40, dSt);
+  for (const l of deckLines) { drawText(x, y, l, dSt); y += lh(dSt); }
+  y += 16;
   rect(x, y, w, 2, HAIR);
-  drawText(x, y + 10, "BY OUR CLIMATE EDITOR  \u00b7  BRASILIA", { sz: 3, tk: 3, be: 1, color: INK_SOFT });
-  y += 10 + 21 + 22;
+  drawText(x, y + 11, "BY OUR CLIMATE EDITOR  \u00b7  LATE EDITION  \u00b7  SUNDAY",
+    { size: SIZE.byline, color: INK_SOFT, weight: 0.12, tk: 2.1, serif: 9 });
+  y += 11 + SIZE.byline + 20;
 
-  const ih = 360;
-  drawGlobe(x, y, w, ih);
-  y += ih + 14;
-
-  const cSt = body(4, INK_SOFT);
-  for (const l of wrapText(LEAD_CAP, w, cSt)) { drawText(x, y, l, cSt); y += 4 * 7 + 8; }
-  drawText(x, y + 2, LEAD_CREDIT, { sz: 3, tk: 2, be: 1, color: BRICK_DK });
-  y += 29 + 16;
-
-  const colW = Math.floor((w - 34) / 2);
-  const p = fitParagraph(LEAD_BODY, colW, LEAD_BOT - y, [5, 4], 2, 2);
-  p.lines.slice(0, p.per * 2).forEach((l, i) => {
-    const c = Math.floor(i / p.per);
-    drawText(x + c * (colW + 34), y + (i % p.per) * p.lh, l, body(p.sz, INK));
-  });
-  rect(x + colW + 17, y, 1, Math.min(p.per * p.lh, LEAD_BOT - y), HAIR);
-  report("lead.body", y, y + p.per * p.lh, LEAD_BOT, p.sz + "pt " + p.lines.length + "L");
+  drawLeadCopy(x, y, w, LEAD_BOT - y);
 }
 
-/* --- right hand column ---------------------------------------------------- */
+/** the story: two columns, a three line drop cap, copy justified to the measure */
+function drawLeadCopy(x: number, y: number, w: number, maxH: number) {
+  const colW = Math.floor((w - 34) / 2);
+  const dropCh = LEAD_BODY[0];
+  const restText = LEAD_BODY.slice(1).trim();
+  let best: { st: TStyle; step: number; dropSize: number; dropW: number; lines: string[]; per: number } | null = null;
+
+  for (const size of [46, 43, 40, 37, 34]) {
+    const st: TStyle = { size, color: INK, weight: 0.105, tk: 1.15, acw: 0.98, lead: 0.44, serif: 11 };
+    const step = lh(st);
+    const dropSize = Math.round(2 * step + size);
+    const dropW = textW(dropCh, { ...st, size: dropSize }) + Math.round(size * 0.55);
+    const lines = wrapSplit(restText, colW - dropW, colW, 3, st, 1.15);
+    const per = Math.ceil(lines.length / 2);
+    best = { st, step, dropSize, dropW, lines, per };
+    if (per * step <= maxH) break;
+  }
+  const c = best!;
+  const shown = Math.min(c.per * 2, c.lines.length);
+  c.lines.slice(0, shown).forEach((l, i) => {
+    const col = Math.floor(i / c.per);
+    const ln = i % c.per;
+    const underCap = col === 0 && ln < 3;
+    const lx = x + col * (colW + 34) + (underCap ? c.dropW : 0);
+    const avail = underCap ? colW - c.dropW : colW;
+    if (i === shown - 1) drawText(lx, y + ln * c.step, l, c.st);
+    else drawJust(lx, y + ln * c.step, l, c.st, avail);
+  });
+  // the initial, its baseline on the third line's baseline
+  const dropSt: TStyle = { ...c.st, size: c.dropSize, weight: 0.125, serif: 12 };
+  drawGlyph(dropCh, x, y + 2 * c.step + c.st.size - c.dropSize, dropSt);
+  rect(x + colW + 17, y, 1.6, Math.min(c.per * c.step, maxH), RULE);
+  report("lead.copy", y, y + c.per * c.step, y + maxH, c.st.size.toFixed(0) + "px " + c.lines.length + "L x2");
+}
+
+function leadPhoto(x: number, y: number, w: number, h: number) {
+  plate(COP31, ...cover(COP31, w, h, 0.5), x, y, w, h);
+
+  shadeRect(x, y, w, h, (u, v) => {
+    const bottom = ss01(0.28, 1.0, v);
+    const top = ss01(0.16, 0.0, v);
+    SHADE[0] = 7; SHADE[1] = 10; SHADE[2] = 14;
+    SHADE[3] = 0.10 + bottom * 0.72 + top * 0.26;
+    return true;
+  });
+  shadeRect(x, y, w, h, (u, v) => {
+    SHADE[0] = 22; SHADE[1] = 44; SHADE[2] = 62;
+    SHADE[3] = 0.10 + 0.05 * (1 - v);
+    return true;
+  });
+
+  const head = fitHead(LEAD_HEAD, w - 104, [94, 88, 82, 76], 3,
+    { color: WHITE, weight: 0.175, tk: -1 });
+  const step = head.st.size * 1.18;
+  const panelH = head.lines.length * step + 44;
+  const panelY = y + h - panelH;
+
+  rect(x, panelY, w, panelH, [9, 13, 19], 0.52);
+  rect(x, panelY, w, 1.8, WHITE, 0.42);
+  rect(x, panelY - 8, 118, 8, BRICK, 1);
+  rect(x, y + 14, textW(LEAD_CREDIT, { size: 16, color: WHITE, weight: 0.13, tk: 1.5 }) + 24, 26, [8, 11, 16], 0.40);
+  drawText(x + 12, y + 19, LEAD_CREDIT, { size: 16, color: WHITE, weight: 0.13, tk: 1.5, alpha: 0.92 });
+
+  let hy = panelY + 22;
+  for (const l of head.lines) { drawText(x + 46, hy, l, head.st); hy += step; }
+  report("lead.picture", y, y + h, y + h, "panel " + panelH.toFixed(0) + " " + head.st.size.toFixed(0) + "px");
+}
+
 function drawSidebar() {
   const x = SIDE_X, w = SIDE_W;
-  const avail = LEAD_H - 52;
-  const slots = [Math.round(avail * 0.349), Math.round(avail * 0.326), 0];
-  slots[2] = avail - slots[0] - slots[1];
+  const gap = 26;
+  const block = (LEAD_BOT - LEAD_TOP - 2 * gap) / 3;
   let y = LEAD_TOP;
 
   SIDE_ITEMS.forEach((item, idx) => {
-    const top = y;
-    if (idx > 0) { rect(x, y - 16, w, 2, HAIR); y += 10; }
+    const top0 = y;
+    if (idx > 0) rect(x, y - gap / 2 - 1, w, 2, RULE);
 
-    rect(x, y + 3, 14, 14, BRICK);
-    drawText(x + 24, y, item.kicker, { sz: 4, tk: 2, be: 1, color: BRICK_DK });
-    y += 28 + 12;
+    const kSt: TStyle = { size: SIZE.sideKick, color: BRICK_DK, weight: 0.15, tk: 2.6 };
+    rect(x, y + 3, 11, 11, BRICK);
+    drawText(x + 20, y, item.kicker, kSt);
+    const kx = x + 20 + textW(item.kicker, kSt) + 12;
+    rect(kx, y + 13, Math.max(0, x + w - kx), 1.2, HAIR);
+    y += SIZE.sideKick + 20;
 
-    const hsz = fitScale(item.head, w, 7);
-    for (const l of item.head) { drawText(x, y, l, { sz: hsz, tk: 1, color: INK }); y += hsz * 7 + Math.round(hsz * 1.7); }
-    y += 8;
+    const head = fitHead(item.head, w, [SIZE.sideHead, 36, 33], 2,
+      { color: INK, weight: 0.175, tk: -1 });
+    for (const l of head.lines) { drawText(x, y, l, head.st); y += head.st.size * 1.14; }
+    y += 12;
 
-    if (item.photo) {
-      drawFireStrip(x, y, w, 130);
-      y += 130 + 10;
+    if (item.art === "capitol") {
+      plate(CAPITOL, 0, 62, 420, 234, x, y, w, item.artH);
+      shadeRect(x, y, w, item.artH, (u, v) => {
+        SHADE[0] = 24; SHADE[1] = 30; SHADE[2] = 44; SHADE[3] = 0.06 + 0.05 * v;
+        return true;
+      });
+      rect(x, y, w, 1.4, INK, 0.5);
+      plateCredit(x, y, w, item.artH, item.credit);
+    } else if (item.art === "ship") {
+      shipArt(x, y, w, item.artH);
+      plateCredit(x, y, w, item.artH, item.credit);
+    } else {
+      chartArt(x, y, w, item.artH);
     }
-    const bottom = top + slots[idx];
-    const bSt = body(4, INK);
-    const p = fitParagraph(item.body, w, bottom - y, [5, 4], 2, 1);
-    p.lines.forEach((l, li) => drawText(x, y + li * p.lh, l, bSt));
-    y = bottom;
-    report("side." + idx, y - slots[idx], y, LEAD_BOT, p.sz + "pt " + p.lines.length + "L");
+    y += item.artH + 8;
+    const cSt: TStyle = { size: SIZE.credit, color: INK_SOFT, weight: 0.115, tk: 1.6, serif: 9 };
+    if (item.caption) drawText(x, y, item.caption, cSt);
+    else textRight(x + w, y, item.credit, { ...cSt, color: BRICK_DK, weight: 0.13 });
+    y += 28;
+
+    const p = fitBody(item.body, w - 11, top0 + block - y, [SIZE.sideBody, 27, 25, 23], 1, 0.96, 1.1);
+    p.st.serif = 10;
+    drawPara(x, y, p.lines, p.st, p.lh, 11, w - 11);
+    y += p.lines.length * p.lh;
+    report("side." + idx, top0, y, top0 + block, p.size.toFixed(0) + "px " + p.lines.length + "L");
+    y = top0 + block + gap;
   });
 }
 
-/* --- footer ticker -------------------------------------------------------- */
 function drawTicker() {
-  rect(M, TICK_TOP, CONTENT, 46, INK);
-  drawText(M + 20, TICK_TOP + 8, "IN BRIEF", { sz: 5, tk: 2, color: WHITE });
-  textRight(M + CONTENT - 20, TICK_TOP + 15, "THE DAY IN BRIEF", { sz: 3, tk: 2, color: WHITE });
+  const bandH = SIZE.kicker + 24;
+  rect(M, TICK_TOP, CONTENT, bandH, INK);
+  rect(M, TICK_TOP + bandH - 3, CONTENT, 3, BRICK);
+  drawText(M + 22, TICK_TOP + 12, "IN BRIEF", { size: SIZE.kicker, color: WHITE, weight: 0.16, tk: 3 });
+  textRight(M + CONTENT - 22, TICK_TOP + 13, "THE DAY IN BRIEF  \u00b7  EDITED BY THE WORLD DESK",
+    { size: 25, color: WHITE, weight: 0.12, tk: 2.2, alpha: 0.84 });
 
-  const gridY = TICK_TOP + 46 + 30;
-  const cw = (CONTENT - 80) / 2;
-  const rh = (H - M - gridY - 20) / 2;
-  rect(M + cw + 40, gridY, 2, rh * 2 + 20, HAIR);
-  rect(M, gridY + rh + 10, CONTENT, 2, HAIR);
+  const gridY = TICK_TOP + bandH + 28;
+  const cw = (CONTENT - 74) / 2;
+  const rh = (H - M - gridY - 16) / 2;
+  rect(M + cw + 37, gridY, 1.8, rh * 2 + 16, RULE);
+  rect(M, gridY + rh + 8, CONTENT, 1.8, RULE);
 
   TICKER.forEach((item, i) => {
-    const cx = M + (i % 2) * (cw + 80);
-    const cy = gridY + Math.floor(i / 2) * (rh + 20);
-    rect(cx, cy + 4, 12, 12, BRICK);
-    drawText(cx + 20, cy, item.reg, { sz: 4, tk: 2, be: 1, color: BRICK_DK });
-    const p = fitParagraph(item.txt, cw, rh - 36, [5, 4], 2, 1);
-    p.lines.forEach((l, li) => drawText(cx, cy + 36 + li * p.lh, l, body(p.sz, INK)));
-    report("brief." + item.reg, cy, cy + 36 + p.lines.length * p.lh, cy + rh, p.sz + "pt " + p.lines.length + "L");
+    const cx = M + (i % 2) * (cw + 74);
+    const cy = gridY + Math.floor(i / 2) * (rh + 16);
+    const kSt: TStyle = { size: SIZE.briefReg, color: BRICK_DK, weight: 0.155, tk: 2.8 };
+    rect(cx, cy + 4, 10, 10, BRICK);
+    drawText(cx + 19, cy, item.reg, kSt);
+    const kx = cx + 19 + textW(item.reg, kSt) + 14;
+    rect(kx, cy + 13, Math.max(0, cx + cw - kx), 1.2, HAIR);
+    const p = fitBody(item.txt, cw - 11, rh - SIZE.briefReg - 26, [SIZE.briefBody, 28, 26, 24], 1, 0.97, 1.2);
+    p.st.serif = 10;
+    drawPara(cx, cy + SIZE.briefReg + 22, p.lines, p.st, p.lh, 11, cw - 11);
+    report("brief." + item.reg, cy, cy + SIZE.briefReg + 22 + p.lines.length * p.lh, cy + rh,
+      p.size.toFixed(0) + "px " + p.lines.length + "L");
   });
+  report("briefs", TICK_TOP, TICK_TOP + bandH, H - M, "band");
 }
 
-/** ordered 4x4 Bayer screen: gives the artwork a printed, screened look */
-function halftone(x: number, y: number, w: number, h: number, levels: number) {
-  const B = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
-  const step = 255 / (levels - 1);
-  for (let j = 0; j < h; j++)
-    for (let i = 0; i < w; i++) {
-      const xi = x + i, yi = y + j;
-      if (xi < 0 || yi < 0 || xi >= W || yi >= H) continue;
-      const k = (yi * W + xi) * 4;
-      const t = (B[(j % 4) * 4 + (i % 4)] + 0.5) / 16;
-      for (let c = 0; c < 3; c++) {
-        const scaled = buf[k + c] / step;
-        const fl = Math.floor(scaled);
-        buf[k + c] = Math.min(255, (scaled - fl > t ? fl + 1 : fl) * step);
+/* ==================================================== 10. down filter + press = */
+
+const out = new Uint8Array(W * H * 4);
+
+function downscale() {
+  const n = SS * SS;
+  for (let j = 0; j < H; j++)
+    for (let i = 0; i < W; i++) {
+      let r = 0, g = 0, b = 0;
+      for (let sy = 0; sy < SS; sy++) {
+        const row = ((j * SS + sy) * DW + i * SS) * 4;
+        for (let sx = 0; sx < SS; sx++) {
+          const k = row + sx * 4;
+          r += dev[k]; g += dev[k + 1]; b += dev[k + 2];
+        }
       }
+      const o = (j * W + i) * 4;
+      out[o] = (r / n + 0.5) | 0;
+      out[o + 1] = (g / n + 0.5) | 0;
+      out[o + 2] = (b / n + 0.5) | 0;
+      out[o + 3] = 255;
     }
 }
 
-/* --- print texture -------------------------------------------------------- */
+/** a whisper of press texture: deterministic, two levels, most pixels untouched */
 function drawGrain() {
-  for (let y = 0; y < H; y++)
-    for (let x = 0; x < W; x++) {
-      let hsh = (x * 374761393 + y * 668265263) | 0;
+  for (let j = 0; j < H; j++)
+    for (let i = 0; i < W; i++) {
+      let hsh = (i * 374761393 + j * 668265263) | 0;
       hsh = (hsh ^ (hsh >>> 13)) * 1274126177;
       const n = ((hsh ^ (hsh >>> 16)) >>> 0) / 4294967295;
-      if (n < 0.42) {
-        const i = (y * W + x) * 4;
-        const d = n < 0.21 ? -6 : 6;
-        buf[i] = Math.max(0, Math.min(255, buf[i] + d));
-        buf[i + 1] = Math.max(0, Math.min(255, buf[i + 1] + d));
-        buf[i + 2] = Math.max(0, Math.min(255, buf[i + 2] + d));
+      if (n < 0.26) {
+        const k = (j * W + i) * 4;
+        const d = n < 0.13 ? -3 : 3;
+        out[k] = clamp(out[k] + d, 0, 255);
+        out[k + 1] = clamp(out[k + 1] + d, 0, 255);
+        out[k + 2] = clamp(out[k + 2] + d, 0, 255);
       }
     }
 }
 
-/* --- layout guard: report every block so overflow cannot hide -------------- */
-const LAYOUT: { name: string; top: number; bottom: number; limit: number; note: string }[] = [];
-function report(name: string, top: number, bottom: number, limit: number, note: string) {
-  LAYOUT.push({ name, top, bottom, limit, note });
-}
-
-/* ============================================================== 7. encoder == */
+/* ============================================================== 11. encoder = */
 
 const CRC_TABLE = (() => {
   const t = new Uint32Array(256);
@@ -701,19 +1224,19 @@ function crc32(b: Uint8Array) {
 }
 
 function chunk(type: string, data: Uint8Array) {
-  const out = new Uint8Array(12 + data.length);
-  const dv = new DataView(out.buffer);
+  const outv = new Uint8Array(12 + data.length);
+  const dv = new DataView(outv.buffer);
   dv.setUint32(0, data.length);
-  for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
-  out.set(data, 8);
-  dv.setUint32(8 + data.length, crc32(out.subarray(4, 8 + data.length)));
-  return out;
+  for (let i = 0; i < 4; i++) outv[4 + i] = type.charCodeAt(i);
+  outv.set(data, 8);
+  dv.setUint32(8 + data.length, crc32(outv.subarray(4, 8 + data.length)));
+  return outv;
 }
 
 /** pick the cheapest of the five PNG filters for every scan line */
 function filterScanlines(rgba: Uint8Array, w: number, h: number) {
   const stride = w * 4;
-  const out = new Uint8Array((stride + 1) * h);
+  const o = new Uint8Array((stride + 1) * h);
   const prev = new Uint8Array(stride);
   const cand = [0, 1, 2, 3, 4].map(() => new Uint8Array(stride));
   for (let y = 0; y < h; y++) {
@@ -742,11 +1265,11 @@ function filterScanlines(rgba: Uint8Array, w: number, h: number) {
       }
       if (score < bestScore) { bestScore = score; best = f; }
     }
-    out[y * (stride + 1)] = best;
-    out.set(cand[best], y * (stride + 1) + 1);
+    o[y * (stride + 1)] = best;
+    o.set(cand[best], y * (stride + 1) + 1);
     prev.set(cur);
   }
-  return out;
+  return o;
 }
 
 function encodePNG(w: number, h: number, rgba: Uint8Array) {
@@ -768,26 +1291,45 @@ function encodePNG(w: number, h: number, rgba: Uint8Array) {
   return png;
 }
 
-/* ================================================================= 8. main == */
+/* ================================================================ 12. main = */
 
-function main() {
-  drawPaper();
+const LAYOUT: { name: string; top: number; bottom: number; limit: number; note: string }[] = [];
+function report(name: string, top: number, bottom: number, limit: number, note: string) {
+  LAYOUT.push({ name, top, bottom, limit, note });
+}
+
+/** every character the page asks the face for must exist: report the strays */
+function auditType() {
+  const missing = [...USED].filter((c) => !GLYPH[c]);
+  return { used: USED.size, missing };
+}
+
+function build() {
+  paperTex();
   drawMasthead();
-  rect(SIDE_X - 20, LEAD_TOP, 2, LEAD_H, HAIR);
+  rect(SIDE_X - 18, LEAD_TOP, 2, LEAD_H, RULE);
   drawLead();
   drawSidebar();
   drawTicker();
+  downscale();
   drawGrain();
+  return encodePNG(W, H, out);
+}
 
-  const png = encodePNG(W, H, buf);
+function main() {
+  const png = build();
   fs.mkdirSync("/output", { recursive: true });
   fs.writeFileSync("/output/entry.png", png);
 
   for (const b of LAYOUT) {
-    const over = b.bottom > b.limit ? "  OVERFLOW" : "";
-    console.log(`  ${b.name.padEnd(14)} ${b.top}..${b.bottom} (limit ${b.limit}) ${b.note}${over}`);
+    const over = b.bottom > b.limit + 0.5 ? "  OVERFLOW" : "";
+    console.log(`  ${b.name.padEnd(13)} ${Math.round(b.top)}..${Math.round(b.bottom)} (limit ${Math.round(b.limit)}) ${b.note}${over}`);
   }
+  const bad = LAYOUT.filter((b) => b.bottom > b.limit + 0.5);
+  const au = auditType();
   console.log(`entry.png ${W}x${H} ${(png.length / 1024).toFixed(0)} KiB  lead=${((LEAD_H / H) * 100).toFixed(1)}% of page height`);
+  console.log(`type: ${au.used} glyphs used` + (au.missing.length ? `, MISSING "${au.missing.join("")}"` : ", all present"));
+  console.log(bad.length ? `LAYOUT OVERFLOW x${bad.length}` : "layout ok");
 }
 
 main();
