@@ -919,7 +919,7 @@ const SIZE = {
   byline: 25,
   caption: 23,
   credit: 19,
-  body: 41,
+  body: 43,
   sideKick: 25,
   sideHead: 39,
   sideBody: 29,
@@ -1021,8 +1021,8 @@ function drawLeadCopy(x: number, y: number, w: number, maxH: number) {
   const restText = LEAD_BODY.slice(1).trim();
   let best: { st: TStyle; step: number; dropSize: number; dropW: number; lines: string[]; per: number } | null = null;
 
-  for (const size of [46, 43, 40, 37, 34]) {
-    const st: TStyle = { size, color: INK, weight: 0.105, tk: 1.15, acw: 0.98, lead: 0.44, serif: 11 };
+  for (const size of [48, 45, 42, 38.5, 35.5]) {
+    const st: TStyle = { size, color: INK, weight: 0.105, tk: 1.15, acw: 0.98, lead: 0.41, serif: 11 };
     const step = lh(st);
     const dropSize = Math.round(2 * step + size);
     const dropW = textW(dropCh, { ...st, size: dropSize }) + Math.round(size * 0.55);
@@ -1120,7 +1120,10 @@ function drawSidebar() {
     }
     y += item.artH + 8;
     const cSt: TStyle = { size: SIZE.credit, color: INK_SOFT, weight: 0.115, tk: 1.6, serif: 9 };
-    if (item.caption) drawText(x, y, item.caption, cSt);
+    if (item.art === "capitol") {
+      const capSt: TStyle = { size: 12, color: INK_SOFT, weight: 0.12, tk: 0.8, acw: 0.88, serif: 8 };
+      drawText(x, y + 3, "THE CAPITOL AT DUSK / REUTERS-STYLE ILLUSTRATION", capSt);
+    } else if (item.caption) drawText(x, y, item.caption, cSt);
     else textRight(x + w, y, item.credit, { ...cSt, color: BRICK_DK, weight: 0.13 });
     y += 28;
 
